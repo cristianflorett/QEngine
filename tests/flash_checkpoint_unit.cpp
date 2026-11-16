@@ -483,6 +483,14 @@ int main() {
             require(selected.body.size()==1 && selected.body[0]==(temp.path/"model-00001-of-00001.safetensors").string(),"body shard not sandbox-joined");
             require(selected.mtp==(temp.path/"model_mtp.safetensors").string(),"MTP output changed");
             require(selected.ngram==(temp.path/"ngram_int8.safetensors").string(),"self-contained ngram path changed");
+            // UNIFIED rule (review R2-4): a recorded self-contained table wins; override/env are
+            // reported as IGNORED by Checkpoint::open and never reach the resolver result.
+            require(resolve_outputs(resolve_manifest,root,true,"",absolute).ngram==(temp.path/"ngram_int8.safetensors").string(),
+                    "operator ngram override must not beat a recorded self-contained table");
+            setenv("FLASH_NGRAM_PATH",absolute.c_str(),1);
+            require(resolve_outputs(resolve_manifest,root,true,"").ngram==(temp.path/"ngram_int8.safetensors").string(),
+                    "FLASH_NGRAM_PATH must not beat a recorded self-contained table");
+            unsetenv("FLASH_NGRAM_PATH");
             require(resolve_outputs(resolve_manifest,root,false,"").mtp.empty(),"unrequested MTP opened");
             const auto override_path=(temp.path/"explicit-mtp.safetensors").string();
             require(resolve_outputs(resolve_manifest,root,true,override_path).mtp==override_path,"explicit MTP override ignored");
