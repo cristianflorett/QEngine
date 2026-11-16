@@ -265,7 +265,11 @@ inline NgramExternal parse_ngram_identity(const Json& j, const std::string& cont
     return n;
 }
 
-struct ResolvedOutputs { std::vector<std::string> body; std::string mtp, ngram; };
+// ngram_override_active: an operator override/env supplied the table WHILE the manifest records a
+// self-contained outputs.ngram. Resolution precedence is deliberate (deployments may relocate the
+// table), but a stale FLASH_NGRAM_PATH silently replacing the recorded table must never be hidden:
+// Checkpoint::open prints a startup warning and states the ACTUAL source in its summary line.
+struct ResolvedOutputs { std::vector<std::string> body; std::string mtp, ngram; bool ngram_override_active=false; };
 inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& directory,
                                        bool want_mtp, const std::string& mtp_override,
                                        const std::string& ngram_override = {}) {
@@ -284,10 +288,14 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     // an operator-supplied override wins over the recorded name: the same checkpoint may mount the
     // n-gram table from wherever the deployment keeps it; identity fields are always re-verified
     // against the manifest afterwards (the table must still be THE table).
-    if (!ngram_override.empty())
+    if (!ngram_override.empty()) {
         result.ngram = resolve_path(directory,ngram_override);  // operator-supplied: absolute or checkpoint-relative
-    else if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env)
+        result.ngram_override_active = outputs.has("ngram");    // beats a recorded self-contained table
+    }
+    else if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env) {
         result.ngram = resolve_path(directory,env);             // runtime setting: same flexibility as the argument
+        result.ngram_override_active = outputs.has("ngram");
+    }
     else if (outputs.has("ngram")) {
         result.ngram = sandbox_file(directory,text(outputs,"ngram",directory),directory+": outputs.ngram");
         require_no_symlink(result.ngram, directory+": outputs.ngram");  // sandboxed name: never followed
@@ -598,9 +606,13 @@ struct Checkpoint {
         }
         if((total+127)/128!=n.rows_per_shard)
             fail(path,"PLE padded row total",std::to_string(128LL*n.rows_per_shard),std::to_string((total+127)/128*128));
+        if (resolved.ngram_override_active)  // single line: a stale env must never silently swap tables
+            fprintf(stderr,"[flash] WARNING: ngram override ACTIVE: opened %s INSTEAD OF recorded %s (identity fields checked; sha256 not verified at load)\n",
+                resolved.ngram.c_str(),sandbox_file(directory,text(j["outputs"],"ngram",path),path+": outputs.ngram").c_str());
         fprintf(stderr,"[flash] validated manifest: 398 body + 11 MTP native INT8 matrices in %zu shards; MTP %s; %s ngram %lld rows plus %lld padding rows, %lld bytes\n",
             resolved.body.size(),want_mtp?"headers validated":"not requested",
-            j["outputs"].has("ngram")?"self-contained":"external",total,128LL*n.rows_per_shard-total,n.size_bytes);
+            resolved.ngram_override_active?"external (override)":(j["outputs"].has("ngram")?"self-contained":"external"),
+            total,128LL*n.rows_per_shard-total,n.size_bytes);
     }
 };
 } // namespace flash
