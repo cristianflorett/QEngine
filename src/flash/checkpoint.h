@@ -281,14 +281,17 @@ inline ResolvedOutputs resolve_outputs(const Json& manifest, const std::string& 
     }
     const auto mtp_name=sandbox_file(directory,text(outputs,"mtp",directory),directory+": outputs.mtp");
     if (seen.count(mtp_name)) fail(directory,"outputs","body/MTP files distinct",mtp_name);
-    if (outputs.has("ngram")) {
+    // an operator-supplied override wins over the recorded name: the same checkpoint may mount the
+    // n-gram table from wherever the deployment keeps it; identity fields are always re-verified
+    // against the manifest afterwards (the table must still be THE table).
+    if (!ngram_override.empty())
+        result.ngram = resolve_path(directory,ngram_override);  // operator-supplied: absolute or checkpoint-relative
+    else if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env)
+        result.ngram = resolve_path(directory,env);             // runtime setting: same flexibility as the argument
+    else if (outputs.has("ngram")) {
         result.ngram = sandbox_file(directory,text(outputs,"ngram",directory),directory+": outputs.ngram");
         require_no_symlink(result.ngram, directory+": outputs.ngram");  // sandboxed name: never followed
     }
-    else if (!ngram_override.empty())
-        result.ngram = resolve_path(directory,ngram_override);  // operator-supplied: absolute is allowed here
-    else if (const char* env = env_str("FLASH_NGRAM_PATH"); env && *env)
-        result.ngram = env;
     else fail(directory,"outputs.ngram","self-contained table or FLASH_NGRAM_PATH / explicit override","external table not configured");
     result.mtp = want_mtp ? resolve_path(directory,mtp_override.empty()?mtp_name:mtp_override) : std::string{};
     if (want_mtp && mtp_override.empty()) require_no_symlink(result.mtp, directory+": outputs.mtp");  // recorded name only; overrides unchanged

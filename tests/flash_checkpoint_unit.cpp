@@ -414,6 +414,13 @@ int main() {
             require(selected.body.size()==1 && selected.body[0]==(temp.path/"model-00001-of-00001.safetensors").string(),"body shard not sandbox-joined");
             require(selected.mtp==(temp.path/"model_mtp.safetensors").string(),"MTP output changed");
             require(selected.ngram==(temp.path/"ngram_int8.safetensors").string(),"self-contained ngram path changed");
+            // runtime override wins over the recorded self-contained name (maintainer ask: relocation at mount time)
+            require(resolve_outputs(resolve_manifest,root,true,"",absolute).ngram==absolute,
+                    "operator ngram override lost to the manifest path");
+            setenv("FLASH_NGRAM_PATH",absolute.c_str(),1);
+            require(resolve_outputs(resolve_manifest,root,true,"").ngram==absolute,
+                    "FLASH_NGRAM_PATH override lost to the manifest path");
+            unsetenv("FLASH_NGRAM_PATH");
             require(resolve_outputs(resolve_manifest,root,false,"").mtp.empty(),"unrequested MTP opened");
             const auto override_path=(temp.path/"explicit-mtp.safetensors").string();
             require(resolve_outputs(resolve_manifest,root,true,override_path).mtp==override_path,"explicit MTP override ignored");
