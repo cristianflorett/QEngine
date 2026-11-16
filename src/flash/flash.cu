@@ -464,12 +464,13 @@ __global__ void k_nf_rows(const float* __restrict__ r, size_t n, unsigned* __res
         if (!isfinite(r[i])) { *flag = 1u; return; }
 }
 std::vector<Plan> make_plan(int ngpu, const std::vector<double>& wts) {
-    // 1 rank: a pipeline stage (whole layers, make_stage_plans); TP: 2 to kMaxTp (4) ranks (the comm / exchange buffers
-    // hold 4 ranks, k_idx_select gathers kMaxTp ranks' keys)
+    // 1 rank: a pipeline stage (whole layers, make_stage_plans); TP: 2 to kMaxTp (5) ranks (the comm / exchange
+    // buffers hold kCommMaxRanks ranks, k_idx_select gathers kMaxTp ranks' keys)
     if (ngpu < 1 || ngpu > kMaxTp || (int)wts.size() != ngpu)
-        throw std::runtime_error("flash: 1 (pipeline stage), 2 to 4 tensor-parallel ranks and as many expert-group weights expected");
+        throw std::runtime_error("flash: 1 (pipeline stage), 2 to 5 tensor-parallel ranks and as many expert-group weights expected");
     static_assert(NQ % 6 == 0 && LNV % 6 == 0 && LNV % LNK == 0, "head splits over 2 and 3 cards");
     static_assert(NQ % 4 == 0 && LNV % 4 == 0 && (LNV / 4) % (LNV / LNK) == 0, "head splits over 4 cards (whole key heads per card)");
+    static_assert(LNV % LNK == 0, "value heads per key head");
     // expert groups (e * 5 + g, e = 0..512 with 512 the shared expert) spread by a largest-deficit interleave in
     // proportion to the weights: consecutive groups of one expert land on different cards (per-token balance)
     const int ng = (NE + 1) * NGRP;
@@ -492,14 +493,22 @@ std::vector<Plan> make_plan(int ngpu, const std::vector<double>& wts) {
         p.rank = r;
         p.ngpu = ngpu;
         p.gcard = card;
-        // DeltaNet: LNV / ngpu value heads, the key heads they use (3 value heads per key head; 3 cards: shared
-        // key heads at the boundaries); QSA: NQ / ngpu q heads (gate / o_proj / combine)
-        p.v0 = r * (LNV / ngpu);
-        p.v1 = (r + 1) * (LNV / ngpu);
-        p.k0 = p.v0 / (LNV / LNK);
-        p.k1 = (p.v1 - 1) / (LNV / LNK) + 1;
-        p.q0 = r * (NQ / ngpu);
-        p.q1 = (r + 1) * (NQ / ngpu);
+        // DeltaNet: value heads [v_begin, v_end) of this rank, the key heads they use (LNV / LNK value heads per key
+        // head, shared at rank boundaries as at 3 cards); QSA: q heads [q_begin, q_end) of this rank (gate / o_proj /
+        // combine). Uneven at 5 ranks (24 q heads -> 4, 5, 5, 5, 5; 48 value heads -> 9, 10, 9, 10, 10), so no range is
+        // assumed equal to NQ / ngpu anywhere: q_capacity() sizes the exchange slots and the real ranges bound the loops.
+        p.v0 = v_begin(r, ngpu);
+        p.v1 = v_end(r, ngpu);
+        p.k0 = k_begin(r, ngpu);
+        p.k1 = k_end(r, ngpu);
+        p.q0 = q_begin(r, ngpu);
+        p.q1 = q_end(r, ngpu);
+        if (p.q1 - p.q0 < 1 || p.q1 - p.q0 > q_capacity(ngpu))
+            throw std::runtime_error("flash: empty QSA q head range for a tensor-parallel rank");
+        if (p.v1 - p.v0 < 1 || p.k1 - p.k0 < 1)
+            throw std::runtime_error("flash: empty DeltaNet head range for a tensor-parallel rank");
+        if (p.k1 - p.k0 > LNK)
+            throw std::runtime_error("flash: DeltaNet key head range larger than the key heads");
         const int g = VOCAB / 128, a = g * r / ngpu, b = g * (r + 1) / ngpu;
         p.voc0 = a * 128;
         p.voc1 = b * 128;
@@ -1287,7 +1296,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
                 if (qx_on_) {
                     std::vector<Int8Block> peers; int j = 0;
                     for (int g = 0; g < p_.ngpu; g++) if (g != p_.rank)
-                        for (int h = g * QPC(p_); h < (g + 1) * QPC(p_); h++, j++)
+                        for (int h = q_begin(g, p_.ngpu); h < q_end(g, p_.ngpu); h++, j++)
                             peers.push_back({a+"q_proj", h*2*HD, HD, 0, H, j*HD, 0});
                     L.qx = load_w8_packed(st, j*HD, H, peers, this, A, st_);
                     if (!qxb_) qxb_ = (float*)dalloc((size_t)PFM*j*HD*4);
@@ -1305,7 +1314,7 @@ void Worker::load(const SafeTensors& st, const HostTables& ht, const SafeTensors
                 int j = 0;
                 for (int g = 0; g < p_.ngpu; g++)
                     if (g != p_.rank)
-                        for (int h = g * QPC(p_); h < (g + 1) * QPC(p_); h++, j++)
+                        for (int h = q_begin(g, p_.ngpu); h < q_end(g, p_.ngpu); h++, j++)
                             xb.push_back({q + (size_t)h * 2 * HD * H, H, HD, H, j * HD, 0});
                 L.qx = load_w8(j * HD, H, xb, this, A, st_);
                 if (!qxb_) qxb_ = (float*)dalloc((size_t)PFM * j * HD * 4);
@@ -2347,12 +2356,12 @@ void Worker::alloc_state() {
         CUDA_CHECK(cudaMemset(rowl1_, 0, (size_t)LAYERS * rowh_n_ * 8));
     }
     {  // sequence-parallel HC prefill: row all-gather protocol (2 channels) and the HC scratch of one chunk's own rows
-        agflags_ = (unsigned*)dalloc(4 * 4 * 4);  // [2 channels][4 senders] flags, then [2 channels][4 readers] acks (pull)
+        agflags_ = (unsigned*)dalloc(2 * 2 * kMaxTp * 4);  // [2 channels][kMaxTp senders] flags, then the same acks (pull)
         agseq_ = (unsigned*)dalloc(2 * 4);
-        agscnt_ = (unsigned*)dalloc(2 * 8 * 4);  // [2 channels][push blocks 4 | pull blocks 4]
-        CUDA_CHECK(cudaMemset(agflags_, 0, 4 * 4 * 4));
+        agscnt_ = (unsigned*)dalloc(2 * 2 * kMaxTp * 4);  // [2 channels][push blocks kMaxTp | pull blocks kMaxTp]
+        CUDA_CHECK(cudaMemset(agflags_, 0, 2 * 2 * kMaxTp * 4));
         CUDA_CHECK(cudaMemset(agseq_, 0, 2 * 4));
-        CUDA_CHECK(cudaMemset(agscnt_, 0, 2 * 8 * 4));
+        CUDA_CHECK(cudaMemset(agscnt_, 0, 2 * 2 * kMaxTp * 4));
         // own rows of one collective unit: <= AG_CAP (ARU_MAX / ngpu, 2 cards: 512)
         // [2 sets]: the comm stream's HC reads and the compute stream's (MTP block input) run concurrently
         sp_hu_ = (float*)dalloc((size_t)2 * AG_CAP * HC * HCD_ROWS * 4);
@@ -2428,9 +2437,9 @@ void Worker::alloc_state() {
     if (!comm_.p2p && p_.ngpu > 1 && p_.rank == 0)
         fprintf(stderr, "[flash] no peer access: attention exchanges through pinned host memory (slower than P2P)\n");
     xrecv_ = (float*)palloc((size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4);
-    xscnt_ = (unsigned*)dalloc(4 * 4);
-    xqscnt_ = (unsigned*)dalloc(4 * 4);
-    xflags_ = (unsigned*)palloc(4 * 4);
+    xscnt_ = (unsigned*)dalloc(kMaxTp * 4);
+    xqscnt_ = (unsigned*)dalloc(kMaxTp * 4);
+    xflags_ = (unsigned*)palloc(kMaxTp * 4);
     xseq_ = (unsigned*)dalloc(4);
     xdone_ = (unsigned*)dalloc(4);
     xqrecv_ = (float*)palloc((size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4);
@@ -2446,35 +2455,36 @@ void Worker::alloc_state() {
         xrecvd_ = (float*)dalloc((size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4);
         xqrecvd_ = (float*)dalloc((size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4);
         if (env_int("QE_HOST_DEVFLAG", 1)) {
-            xflagd_ = (unsigned*)dalloc(4 * 4);
-            xqflagd_ = (unsigned*)dalloc(4 * 4);
-            CUDA_CHECK(cudaMemset(xflagd_, 0, 4 * 4));
-            CUDA_CHECK(cudaMemset(xqflagd_, 0, 4 * 4));
-            xiflagd_ = (unsigned*)dalloc(4 * 4);
-            CUDA_CHECK(cudaMemset(xiflagd_, 0, 4 * 4));
-            xpcnt_ = (unsigned*)dalloc(12 * 4);
-            CUDA_CHECK(cudaMemset(xpcnt_, 0, 12 * 4));
+            xflagd_ = (unsigned*)dalloc(kMaxTp * sizeof(unsigned));
+            xqflagd_ = (unsigned*)dalloc(kMaxTp * sizeof(unsigned));
+            CUDA_CHECK(cudaMemset(xflagd_, 0, kMaxTp * sizeof(unsigned)));
+            CUDA_CHECK(cudaMemset(xqflagd_, 0, kMaxTp * sizeof(unsigned)));
+            xiflagd_ = (unsigned*)dalloc(kMaxTp * sizeof(unsigned));
+            CUDA_CHECK(cudaMemset(xiflagd_, 0, kMaxTp * sizeof(unsigned)));
+            xpcnt_ = (unsigned*)dalloc(3 * kMaxTp * 4);
+            CUDA_CHECK(cudaMemset(xpcnt_, 0, 3 * kMaxTp * 4));
         }
     }
-    xqflags_ = (unsigned*)palloc(4 * 4);
+    xqflags_ = (unsigned*)palloc(kMaxTp * 4);
     xqseq_ = (unsigned*)dalloc(4);
     xqdone_ = (unsigned*)dalloc(4);
     xirecv_ = (float*)palloc((size_t)XSLOT * p_.ngpu * XROWS * IDX_TOPB * 4);
-    xiflags_ = (unsigned*)palloc(4 * 4);
+    xiflags_ = (unsigned*)palloc(kMaxTp * 4);
     if (comm_.p2p && comm_.dhost && p_.ngpu > 1) {  // decode exchanges through host memory (QE_DECODE_COMM / calibration)
         // on this card's NUMA node (it polls them), host pointer = device pointer (checked in comm_host_alloc)
         auto halloc = [&](size_t bytes) -> void* { return comm_host_alloc(bytes, gpu_numa_node(dev_)); };
         xrecvH_ = (float*)halloc((size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4);
         xqrecvH_ = (float*)halloc((size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4);
         xirecvH_ = (float*)halloc((size_t)XSLOT * p_.ngpu * XROWS * IDX_TOPB * 4);
-        xflagsH_ = (unsigned*)halloc(4 * 4);
-        xqflagsH_ = (unsigned*)halloc(4 * 4);
-        xiflagsH_ = (unsigned*)halloc(4 * 4);
+        xflagsH_ = (unsigned*)halloc(kMaxTp * sizeof(unsigned));
+        xqflagsH_ = (unsigned*)halloc(kMaxTp * sizeof(unsigned));
+        xiflagsH_ = (unsigned*)halloc(kMaxTp * sizeof(unsigned));
         if (env_int("QE_HOST_XPULL", 1)) {  // their device pull slots (xpull, bpx03#21), outside allocs_: free_dhost frees them
             // (an allocation failure only costs speed: the consumers then read the host slots, as before)
             const size_t bx = (size_t)XSLOT * p_.ngpu * XROWS * xper(p_) * 4, bq = (size_t)XSLOT * p_.ngpu * XROWS * qper(p_) * 4;
             void* q[6] = {};
-            const size_t b[6] = {bx, bq, 16, 16, 16, 48};
+            const size_t b[6] = {bx, bq, kMaxTp * sizeof(unsigned), kMaxTp * sizeof(unsigned),
+                                 kMaxTp * sizeof(unsigned), 3 * kMaxTp * sizeof(unsigned)};
             bool ok = true;
             for (int i = 0; i < 6 && ok; i++)
                 if (cudaMalloc(&q[i], b[i]) != cudaSuccess) (void)cudaGetLastError(), q[i] = nullptr, ok = false;
@@ -2495,7 +2505,7 @@ void Worker::alloc_state() {
     }
     xiseq_ = (unsigned*)dalloc(4);
     xidone_ = (unsigned*)dalloc(4);
-    xiscnt_ = (unsigned*)dalloc(4 * 4);
+    xiscnt_ = (unsigned*)dalloc(kMaxTp * 4);
     alloc_staging();  // staged prefill transfers (FLASH_COMM ce / host)
     // block selection of a whole prefill chunk at once (XROWS rows: one indexer exchange per chunk, not per 32 rows)
     if (kvs_) psel_ = (int*)dalloc((size_t)MAXM * (srows_ / IDX_R) * 4);
@@ -4577,11 +4587,14 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             if (qloc) {
                 const int nqx = (NQ - ql) * HD;
                 rows8(L.qx, x_, H, qxb_, nqx, m, st_);
-                for (int g = 0, j = 0; g < p_.ngpu; g++)
-                    if (g != p_.rank)
-                        (kv4_ ? k_qsa_prep<true> : k_qsa_prep<false>)<<<dim3(QPC(p_), m), 256, 0, st_>>>(qxb_ + (size_t)(j++) * QPC(p_) * HD, nqx, L.q_norm, L.k_norm, curpos_,
-                                                                     qbuf_, L.kc, L.vc, L.ks, L.vs, p_, QPC(p_), g * QPC(p_),
-                                                                     nullptr, rbcur_, nullptr, kvmap(L));
+                for (int g = 0, j = 0; g < p_.ngpu; g++) {
+                    if (g == p_.rank) continue;
+                    const int nh = q_count(g, p_.ngpu);
+                    (kv4_ ? k_qsa_prep<true> : k_qsa_prep<false>)<<<dim3(nh, m), 256, 0, st_>>>(qxb_ + (size_t)j * HD, nqx, L.q_norm, L.k_norm, curpos_,
+                                                             qbuf_, L.kc, L.vc, L.ks, L.vs, p_, nh, q_begin(g, p_.ngpu),
+                                                             nullptr, rbcur_, nullptr, kvmap(L));
+                    j += nh;
+                }
                 k_qxlocal16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(qb, mr, xq, p_);
                 KCHK("q local");
             } else {
@@ -4824,7 +4837,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
             const bool cstg = xstage_ && xout_ && mr > 8;
             const Xchg xcs = cstg ? xchg_outbox(1, xc, cpar, xper(p_)) : xc;
             if (!pf_ && !cdh && !cstg && p_.ngpu > 1) comm_test_spin(st_);  // test (QE_DECODE_TEST_STORE_US)
-            xb_add(XB_PART, (size_t)mr * (x16o ? (size_t)QPC(p_) * XP16 * 4 : (size_t)xper(p_) * 4) * (p_.ngpu - 1));
+            xb_add(XB_PART, (size_t)mr * (x16o ? (size_t)q_capacity(p_.ngpu) * XP16 * sizeof(float) : (size_t)xper(p_) * sizeof(float)) * (p_.ngpu - 1));
             if (qsa_split_ && !dh && qsa_defers(m, sel_on_)) {  // pipelined: the combine + o_proj in qsa_back
                 // (qsa_defers(m) = x16o && (!cstg || xcs_) && mr == m: the pipelined loop asks it before the chunk)
                 // CE (FLASH_QSA_PIPE_CE): the outbox of this parity is free once its previous side copies finished; the
@@ -4835,7 +4848,7 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                     k_seq_word<<<1, 1, 0, st_>>>(xsw_ + 4 + cpar, xc.seq, qsa_ahead_);
                     CUDA_CHECK(cudaEventRecord(xcf_, st_));
                     CUDA_CHECK(cudaStreamWaitEvent(xcs_, xcf_, 0));
-                    xchg_send(1, xc, cpar, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_), xcs_, xsw_ + 4 + cpar);
+                    xchg_send(1, xc, cpar, mr, (size_t)q_capacity(p_.ngpu) * XP16 * sizeof(float), xper(p_), xcs_, xsw_ + 4 + cpar);
                     CUDA_CHECK(cudaEventRecord(xce_[cpar], xcs_));
                     xce_rec_[cpar] = true;
                 }
@@ -4845,8 +4858,8 @@ void Worker::qsa(Layer& L, int li, int pos, int m) {
                 return;
             } else if (x16o) {
                 if (p_.ngpu > 1) k_xsend16<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
-                if (cstg) { xchg_send(1, xc, cpar, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_)); ce_prewait(xc); }
-                else xpull(xc, 1, mr, (size_t)QPC(p_) * XP16 * 4, xper(p_));
+                if (cstg) { xchg_send(1, xc, cpar, mr, (size_t)q_capacity(p_.ngpu) * XP16 * sizeof(float), xper(p_)); ce_prewait(xc); }
+                else xpull(xc, 1, mr, (size_t)q_capacity(p_.ngpu) * XP16 * sizeof(float), xper(p_));
                 k_qsa_comb16<<<dim3(ql, mr), HD, 0, st_>>>(attn_x_, mr, prow, ld, abr, ql * HD, xc, p_, nqp * HD, kv4_);
             } else {
             if (p_.ngpu > 1) k_xsend<<<dim3(p_.ngpu - 1, std::min(16, (mr + 3) / 4)), 256, 0, st_>>>(attn_x_, mr, xcs, p_);
@@ -4890,7 +4903,7 @@ void Worker::xpull(Xchg& x, int kind, int mr, size_t rowb, size_t per) {
     if (!f) return;
     const int bytes = kind == 2 ? 0 : (int)((size_t)mr * rowb);
     const int gy = std::max(1, std::min(8, bytes / 16384));
-    k_xpull<<<dim3(p_.ngpu - 1, gy), 256, 0, st_>>>(x.recv[p_.rank], d, x.flags[p_.rank], f, x.seq, (hv ? xpcntH_ : xpcnt_) + 4 * kind, p_.rank,
+    k_xpull<<<dim3(p_.ngpu - 1, gy), 256, 0, st_>>>(x.recv[p_.rank], d, x.flags[p_.rank], f, x.seq, (hv ? xpcntH_ : xpcnt_) + kMaxTp * kind, p_.rank,
                                                     p_.ngpu, (size_t)XROWS * per, bytes);
     KCHK("k_xpull");
     if (d) x.recv[p_.rank] = d;
@@ -5849,10 +5862,10 @@ void Worker::alloc_staging() {
     }
     xout_ = (float*)dalloc((size_t)p_.ngpu * XROWS * xper(p_) * 4);
     xoutc_ = (float*)dalloc((size_t)2 * p_.ngpu * XROWS * xper(p_) * 4);  // [parity]: pipelined partials (CE side copies)
-    xdummy_ = (unsigned*)dalloc(4 * 4);
+    xdummy_ = (unsigned*)dalloc(kMaxTp * sizeof(unsigned));
     if (comm_.xfer == kXferCE) {  // the sequence-number words the copy engine copies into the peers' flags
         xouti_ = (float*)dalloc((size_t)p_.ngpu * XROWS * xper(p_) * 4);
-        agw_ = (unsigned*)dalloc(4 * 4);
+        agw_ = (unsigned*)dalloc(kMaxTp * sizeof(unsigned));
     }
     // the pipelined partials (CE, and host staging unless FLASH_QSA_PIPE_HOST=0): the side stream of their copies and
     // their precomputed flag values
@@ -5870,8 +5883,8 @@ void Worker::alloc_staging() {
         CUDA_CHECK(cudaHostGetDevicePointer((void**)&d, h, 0));
         return d;  // == h (UVA)
     };
-    hagf_ = mapped(2 * 2 * 4 * 4);
-    hxf_ = mapped(3 * 4 * 4);  // (3 kinds: the indexer exchange's words are hxf_ + 8)
+    hagf_ = mapped(2 * 2 * kMaxTp * 4);
+    hxf_ = mapped(3 * kMaxTp * 4);  // (3 kinds: the indexer exchange's words follow the others)
     if (comm_.xfer != kXferHost) return;
     auto pinned = [&](size_t b) {
         constexpr size_t PG = (size_t)2 << 20;
@@ -5939,13 +5952,13 @@ void Worker::xchg_send(int e, Xchg& x, int par, int mr, size_t rowb, size_t per,
         if (g != R)
             CUDA_CHECK(cudaMemcpyAsync(hb + (size_t)g * XROWS * xper(p_), ob + (size_t)g * XROWS * xper(p_), bytes, cudaMemcpyDeviceToHost, st));
     FlagP fp;
-    for (int g = 0; g < 4; g++) fp.f[g] = hxf_p_[g] ? hxf_p_[g] + e * 4 : nullptr;
+    for (int g = 0; g < kMaxTp; g++) fp.f[g] = hxf_p_[g] ? hxf_p_[g] + e * kMaxTp : nullptr;
     // (flagw: the pipelined partials on the side stream; the counter may move meanwhile (the pending chunk's combine),
     // so the value was computed on the compute stream before the copies were forked)
     const unsigned* const sv = flagw ? flagw : x.seq;
     const int sa = flagw ? 0 : 1;
     k_xs_flag<<<1, 32, 0, st>>>(fp, sv, R, ng, sa);
-    k_xs_wait<<<1, 32, 0, st>>>(hxf_ + e * 4, sv, R, ng, sa);
+    k_xs_wait<<<1, 32, 0, st>>>(hxf_ + e * kMaxTp, sv, R, ng, sa);
     if (!comm_.p2p) {  // never host -> host: such copy nodes in the prefill graphs ended in launch failures (v5, 3 cards
                        // without P2P, 32K / 90K): the staged slots must be device memory
         cudaPointerAttributes pa{};
@@ -5995,16 +6008,16 @@ void Worker::hc_rows(const HcW& w, float* R, float* inj, bf16* x, __half* xh, in
 void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, const int* rr, int rowb0) {
     RowAg a;
     for (int k = 0; k < 3; k++)
-        for (int g = 0; g < 4; g++) a.dst[k][g] = agdst_[k][g];
+        for (int g = 0; g < kMaxTp; g++) a.dst[k][g] = agdst_[k][g];
     a.rowb[0] = rowb0 ? rowb0 : H * 2;  // (rowb0: the x arrays as compact rows of that size, agq_on_)
     a.rowb[1] = H * 2;
     a.rowb[2] = RW * 4;
-    for (int g = 0; g < 4; g++) a.flags[g] = agpf_[g] ? agpf_[g] + ch * 4 : nullptr;
-    for (int g = 0; g < 4; g++) a.acks[g] = agpf_[g] ? agpf_[g] + 8 + ch * 4 : nullptr;
+    for (int g = 0; g < kMaxTp; g++) a.flags[g] = agpf_[g] ? agpf_[g] + ch * kMaxTp : nullptr;
+    for (int g = 0; g < kMaxTp; g++) a.acks[g] = agpf_[g] ? agpf_[g] + 2 * kMaxTp + ch * kMaxTp : nullptr;
     a.seq = agseq_ + ch;
-    a.scnt = agscnt_ + ch * 8;
+    a.scnt = agscnt_ + ch * 2 * kMaxTp;
     a.pm = 0;
-    for (int g = 0; g < 8; g++) a.rr[g] = rr ? rr[g] : 0;
+    for (int g = 0; g < 2 * kMaxTp; g++) a.rr[g] = rr && g < 2 * p_.ngpu ? rr[g] : 0;
     static const bool ce_env = env_int("FLASH_AG_CE", 0);  // 1: rows by the copy engine (26K 6.05 -> 6.13 s: slower)
     const bool ce = ce_env || comm_.xfer == kXferCE;
     if (comm_.xfer == kXferHost && hag_h_ && hagf_ && rr) {
@@ -6015,11 +6028,11 @@ void Worker::row_ag(unsigned amask, int r0, int r1, cudaStream_t s, int ch, cons
         for (int k = 0; k < 3; k++) koff[k] = o, o += (size_t)AG_CAP * a.rowb[k];
         RowAg ah = a;
         AckP ack;
-        for (int g = 0; g < 4; g++) {
-            ah.flags[g] = hagf_p_[g] ? hagf_p_[g] + ch * 8 : nullptr;
-            ack.w[g] = hagf_p_[g] ? hagf_p_[g] + ch * 8 + 4 : nullptr;
+        for (int g = 0; g < kMaxTp; g++) {
+            ah.flags[g] = hagf_p_[g] ? hagf_p_[g] + ch * 2 * kMaxTp : nullptr;
+            ack.w[g] = hagf_p_[g] ? hagf_p_[g] + ch * 2 * kMaxTp + kMaxTp : nullptr;
         }
-        k_rag_ackwait<<<1, 32, 0, s>>>(hagf_ + ch * 8 + 4, a.seq, p_.rank, p_.ngpu);
+        k_rag_ackwait<<<1, 32, 0, s>>>(hagf_ + ch * 2 * kMaxTp + kMaxTp, a.seq, p_.rank, p_.ngpu);
         for (int k = 0; k < 3; k++)
             if (((amask >> k) & 1) && r1 > r0) {
                 CHECK(r1 - r0 <= AG_CAP, "row_ag: %d rows", r1 - r0);
@@ -6267,7 +6280,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             // MoE input (agq_on_): HC read, router (W8A8 row GEMM + top-10 from bf16(xh), as moe() does) and the
             // INT8 g64 quantization on the owner rows, compact rows (k_agq_pack) through the x arrays, unpacked into
             // XQ + scales in the XH rows and the batch routing rows (gsel_ / gw_ / gsh_ at absolute rows)
-            int rr[8];
+            int rr[2 * kMaxTp];
             for (int g = 0; g < p_.ngpu; g++) rr[2 * g] = rows_of(u, g), rr[2 * g + 1] = rows_of(u, g + 1);
             const int nr = o1 - o0;
             __half* const xho = xhb + (size_t)o0 * H;
@@ -6289,7 +6302,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
                                                gsel_ + (size_t)off * TOPK, gw_ + (size_t)off * TOPK, gsh_ + off, o0 - off, o1 - off);
             KCHK("agq unpack");
         } else if (sp && next) {
-            int rr[8];
+            int rr[2 * kMaxTp];
             for (int g = 0; g < p_.ngpu; g++) rr[2 * g] = rows_of(u, g), rr[2 * g + 1] = rows_of(u, g + 1);
             hc_rows(*next, Rb + (size_t)o0 * RW, injb + (size_t)o0 * HC, xb + (size_t)o0 * H, xhb + (size_t)o0 * H, o1 - o0, ps);
             row_ag(2, o0, o1, ps, 0, rr);
@@ -6345,7 +6358,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
     };
     auto last_row_R = [&](cudaStream_t s, int ch) {  // the last row's residual (owned by one rank of the last unit)
         const int u = nu - 1;
-        int rr[8];
+        int rr[2 * kMaxTp];
         for (int g = 0; g < p_.ngpu; g++) {
             const bool has = n - 1 >= rows_of(u, g) && n - 1 < rows_of(u, g + 1);
             rr[2 * g] = has ? n - 1 : 0;
@@ -6360,7 +6373,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             const int row = pf_end_[j] - 1;
             int u = 0;
             while (ub[u + 1] <= row) u++;
-            int rr[8];
+            int rr[2 * kMaxTp];
             for (int g = 0; g < p_.ngpu; g++) {
                 const bool has = row >= rows_of(u, g) && row < rows_of(u, g + 1);
                 rr[2 * g] = has ? row : 0;
@@ -6581,7 +6594,7 @@ void Worker::trunk_batch_sp(int n, unsigned selmask) {
             KCHK("mtp prep sp");
             hc_rows(mtp_.hca, Ro, injb + (size_t)o0 * HC, xb + (size_t)o0 * H, xhb + (size_t)o0 * H, nr, st_);
         }
-        int rr[8];
+        int rr[2 * kMaxTp];
         for (int g = 0; g < p_.ngpu; g++) rr[2 * g] = rows_k(u, g), rr[2 * g + 1] = rows_k(u, g + 1);
         row_ag(2, o0, o1, st_, 1, rr);
         xb_add(XB_AG_MIXIN, (size_t)nr * H * 2 * (p_.ngpu - 1));
