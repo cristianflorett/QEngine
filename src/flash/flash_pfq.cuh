@@ -830,12 +830,11 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
     else if (threadIdx.x == 0 && dbg == 5) s_s = *xq.seq + 1;  // the flags were waited for by k_qpf_qwait (CE path): no spin here
     else if (threadIdx.x == 0) {  // the peers' q rows of this kv head's heads
         const unsigned s = *xq.seq + 1;
-        for (int hh = kvh * HPG; hh < kvh * HPG + HPG; hh += QPC(p)) {
-            const int ow = hh / QPC(p);
+        // every owner of a real head of this KV head's group (uneven ranges: a group can span two or three ranks)
+        for (int hh = kvh * HPG; hh < kvh * HPG + HPG; hh++) {
+            const int ow = q_owner(hh, p.ngpu);
             if (ow != p.rank) for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow)); }
         }
-        const int ow2 = (kvh * HPG + HPG - 1) / QPC(p);
-        if (ow2 != p.rank) for (unsigned ws_ = 0; (int)(qe_ld_acquire_sys(xq.flags[p.rank] + ow2) - s) < 0;) { __nanosleep(20); QE_WD_POLL(ws_, kWdQsaX, ow2, s, qe_ld_acquire_sys(xq.flags[p.rank] + ow2)); }
         s_s = s;
     }
     __syncthreads();
@@ -876,11 +875,11 @@ __global__ void __launch_bounds__(QP_W * 32, 1) k_qsa_pfsel(const float* __restr
             const int r = qi / HPG, h = kvh * HPG + qi % HPG, t = t0 + r;
             f = nullptr; hp = nullptr;
             if (t >= m) return;
-            const int owner = h / QPC(p);
+            const int owner = q_owner(h, p.ngpu);
             if (owner == p.rank) f = qb + ((size_t)t * (NQ + 4) + h) * HD;
             else if (q16) hp = reinterpret_cast<const __half*>(xq.recv[p.rank] + ((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS * qper(p)) +
-                               (size_t)t * qper(p) + (h - owner * QPC(p)) * HD;
-            else f = xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - owner * QPC(p)) * HD;
+                               (size_t)t * qper(p) + (h - q_begin(owner, p.ngpu)) * HD;
+            else f = xq.recv[p.rank] + (((size_t)(s_s & (XSLOT - 1)) * p.ngpu + owner) * XROWS + t) * qper(p) + (h - q_begin(owner, p.ngpu)) * HD;
         };
         const float *f0, *f1;
         const __half *h0, *h1;

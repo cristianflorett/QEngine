@@ -92,17 +92,75 @@ Original resource-blocked checks included GPU INT8 execution, paired INT8 baseli
 ## Upstream 1.3.6 integration
 
 PR [#26](https://github.com/bpx03/QEngine/pull/26) incorporates upstream through merge `5f41ec5`, followed by
-correction `0502d78`. The integration preserves native INT8 support alongside upstream KV4, packed down-projection,
+correction `0502d78`. The integration preserves native INT8 and TP5 support alongside upstream KV4, packed down-projection,
 n-gram worker and slab-set changes.
+
+The correction uses `NKV` consistently and keeps one `k_dn_rec_b` definition in `flash_kernels.cuh`,
+callable from production batch code and the standalone fixture. Its body retains upstream's padded shared-memory
+bank-conflict fix.
 
 Observed checks for the merged code:
 
-- `qflash`, `flash_run`, checkpoint and INT8 fixture targets compiled.
+- `qflash`, `flash_run`, checkpoint, INT8 and TP5 fixture targets compiled.
 - CPU checkpoint and GPU INT8 fixtures printed `ok`.
+- The first TP5 fixture execution aborted with CUDA out-of-memory while Maya occupied the GPUs. The wrapper
+  subsequently printed its final marker and exited zero; that wrapper exit is **not** a TP5 pass.
 - Runtime image `qengine:qfn-int8-20261115T161932Z-r4` built successfully with CUDA architecture 86 and vision disabled.
 - GitHub reported head `0502d7883cf1c046a9a0f5f2a696c9671f5d21ca` as `MERGEABLE`, with merge state `CLEAN`.
 
 No throughput or latency improvement is inferred from compilation, fixture results, or mergeability.
+
+### Final merged-build verification (2026-11-16)
+
+With Maya stopped and all five GPUs available, `flash_tp5_unit --ranks 5`
+passed host LL reduce/gather (70 graph units), FP32/FP16 staged exchanges,
+and DeltaNet. The same build passed `compute-sanitizer --tool memcheck
+--error-exitcode 1 ... --ranks 5 --small`, with `ERROR SUMMARY: 0 errors`.
+P2P-specific transport was not exercised.
+
+The deployed API identified version `1.3.6`, build `0502d78`, forced TP,
+two slots, maximum context 131072, and host-staged/pinned-host collectives.
+Concurrent nonstream `7*8` and streaming `12*12` returned `56` and `144`;
+the streaming response included `[DONE]`.
+
+The full Club campaign used three warmups and five measured runs per
+narrative/code workload, plus three fresh measured prompts at each prefill
+depth. Thinking was disabled; sampling was temperature 0.6, top_p 0.95,
+top_k 20 and min_p 0.0. Hardware: five RTX 3090 cards at 230 W each,
+PCIe Gen3 (three x16, two x8), 188.6 GiB system RAM.
+
+| Workload | Mean wall tok/s | Mean decode tok/s | Decode CV | Mean TTFT |
+| --- | ---: | ---: | ---: | ---: |
+| Narrative | 88.72 | 90.06 | 2.7% | 166 ms |
+| Code | 49.39 | 50.42 | 9.7% | 232 ms |
+
+| Prefill target | Actual prompt tokens | Mean prefill tok/s | CV | Mean TTFT |
+| --- | ---: | ---: | ---: | ---: |
+| 10K | 10367 / 10367 / 9997 | 1387.62 | 0.7% | 7382 ms |
+| 90K | 93331 / 89998 / 93331 | 1485.41 | 0.3% | 62087 ms |
+
+All five runs per decode workload were usable. Client/server decode
+cross-checks agreed to displayed precision (0.0% divergence). Capture
+integrity and serving-process swap checks passed. Post-run VRAM usage was
+23801–23803 MiB/card. The 1060 MiB aggregate increase from the pre-benchmark
+snapshot is not by itself evidence of a memory leak.
+
+These are single-configuration observations, not an interleaved A/B test
+against the previous build, INT4 or BF16, nor a quality or long-duration
+soak evaluation.
+
+Raw evidence is under
+`/home/cristian/qe-int8-results-20261115T161932Z/r4-auto256/`:
+`unit-tp5.log`, `memcheck-tp5.log`, `readiness.log`,
+`api-smoke-results.json`, API identity snapshots, `benchmark.log`,
+`container-after.json` and `server.log`.
+
+After the campaign, QEngine was stopped cleanly (exit 0, not OOM-killed).
+Maya was restored using the original `/Proyectos/Strata-958` working
+directory, Python executable, configuration and command arguments.
+Its `/health` endpoint returned `status=ok`, context 1048576 and images
+enabled. The desktop QEngine launcher now selects the verified r4 image;
+its shell syntax and executable permission were checked.
 
 ## Rollout handoff (2026-11-08)
 

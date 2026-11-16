@@ -198,11 +198,11 @@ COPY tests ./tests
 # same flags as the main image (sm_86, Release, distro GCC 13); build Flash and its acceptance tests, no libqengine
 RUN cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DQE_BUILD_FLASH_INT8_TESTS=ON \
       "-DCMAKE_CUDA_ARCHITECTURES=${CUDA_ARCHS}" "-DQE_GIT_HASH=${REVISION}" \
-    && cmake --build build --target qflash flash_run flash_checkpoint_unit flash_int8_unit -j 3
+    && cmake --build build --target qflash flash_run flash_checkpoint_unit flash_int8_unit flash_tp5_unit -j 3
 # the runtime binds libqflash.so through ctypes and calls the same qe_* contract as libqengine: the
 # overlay is only usable if that entry-point surface is there (a missing symbol means the server starts
 # and dies on the first request)
-RUN test -f build/libqflash.so -a -f build/flash_run -a -f build/flash_checkpoint_unit -a -f build/flash_int8_unit \
+RUN test -f build/libqflash.so -a -f build/flash_run -a -f build/flash_checkpoint_unit -a -f build/flash_int8_unit -a -f build/flash_tp5_unit \
     && for s in qe_create qe_destroy qe_max_context qe_start3 qe_spec_step qe_vocab; do \
          nm -D --defined-only build/libqflash.so | grep -q " $s$" \
              || { echo "libqflash.so does not export $s"; exit 1; }; \
@@ -213,4 +213,5 @@ COPY --from=flash-build /src/build/libqflash.so /app/build/libqflash.so
 COPY --from=flash-build /src/build/flash_run /app/build/flash_run
 COPY --from=flash-build /src/build/flash_checkpoint_unit /app/build/flash_checkpoint_unit
 COPY --from=flash-build /src/build/flash_int8_unit /app/build/flash_int8_unit
+COPY --from=flash-build /src/build/flash_tp5_unit /app/build/flash_tp5_unit
 COPY --from=flash-build /src/build/qe_build.txt /app/build/qe_build.txt

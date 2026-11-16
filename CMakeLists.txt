@@ -142,4 +142,11 @@ if(EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/tests/flash_int8_unit.cu)  # GPU unit: bui
   target_link_libraries(flash_int8_unit PRIVATE CUDA::cudart CUDA::cuda_driver)
   target_include_directories(flash_int8_unit PRIVATE ${CMAKE_BINARY_DIR}/gen)
   add_dependencies(flash_int8_unit qe_build_id)
+  # five-rank fixture (TP5): the uneven head splits, the padded exchange slots and the five-sender QSA combine
+  add_executable(flash_tp5_unit tests/flash_tp5_unit.cu src/build_id.cpp $<TARGET_OBJECTS:qkernels>)
+  target_include_directories(flash_tp5_unit PRIVATE src)
+  target_link_libraries(flash_tp5_unit PRIVATE qflash CUDA::cudart CUDA::cuda_driver)  # make_plan / plan_groups
+  set_target_properties(flash_tp5_unit PROPERTIES BUILD_RPATH "$ORIGIN")
+  target_include_directories(flash_tp5_unit PRIVATE ${CMAKE_BINARY_DIR}/gen)
+  add_dependencies(flash_tp5_unit qe_build_id)
 endif()
