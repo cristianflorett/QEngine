@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/load_drop_unit.dir/tests/load_drop_unit.cpp.o CMakeFiles/load_drop_unit.dir/src/safetensors.cpp.o -o load_drop_unit 

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/comm_rule_unit.dir/tests/comm_rule_unit.cpp.o -o comm_rule_unit 

@@ -1,0 +1,1 @@
+/usr/bin/c++ -O3 -DNDEBUG CMakeFiles/flash_checkpoint_unit.dir/tests/flash_checkpoint_unit.cpp.o CMakeFiles/flash_checkpoint_unit.dir/src/safetensors.cpp.o -o flash_checkpoint_unit 

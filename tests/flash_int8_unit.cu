@@ -655,7 +655,9 @@ static void real_samples(const std::string& model) {
     }
     std::sort(files.begin(),files.end());
     if (files.empty()) throw std::runtime_error(model+": no body safetensors files");
-    for (const auto& f : files) { checkpoint_detail::validate_file(f); tensors.open(f); }
+    // SafeTensors::open parses every shard header here and validate_int8_tensor below checks the
+    // shapes; the framing validator of the manifest route is checkpoint.h's own guarded open
+    for (const auto& f : files) tensors.open(f);
     const std::string prefix="model.language_model.layers.0.mlp.experts.";
     const auto& gq=tensors.get(prefix+"gate_up_proj.weight_packed");
     const auto& gs=tensors.get(prefix+"gate_up_proj.weight_scale");

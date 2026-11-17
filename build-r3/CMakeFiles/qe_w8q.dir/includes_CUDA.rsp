@@ -1,0 +1,1 @@
+-I"/work/build-r3/gen" -I/work/src -isystem "/usr/local/cuda/targets/x86_64-linux/include"

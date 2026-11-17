@@ -194,7 +194,7 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
 #pragma unroll
     for (int a = 0; a < WT; a++) {
         qp[a] = pj.w.gq + (size_t)(tw0 + a) * chunks * 32 + lane;
-        sp[a] = static_cast<const char*>(pj.w.gs) + (size_t)(tw0 + a) * groups * 16 * 2;
+        sp[a] = reinterpret_cast<const char*>(pj.w.gs) + (size_t)(tw0 + a) * groups * 16 * 2;
     }
     float acc[WT][NTT][4];
 #pragma unroll
@@ -204,7 +204,7 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
 #pragma unroll
     for (int s = 0; s < NST - 1; s++) stage(s);
     uint4 wn[WT][NW], wn2[WT][NW];  // weights of the next two steps
-    float sn[WT][2], sn2[WT][2];
+    typename ScaleRaw<Bits>::type sn[WT][2], sn2[WT][2];  // weight scales (rows g, g + 8) of the next two steps
 #pragma unroll
     for (int a = 0; a < WT; a++) {
 #pragma unroll
@@ -212,8 +212,8 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
             wn[a][q] = __ldg(qp[a] + q * 32);
             wn2[a][q] = __ldg(qp[a] + (NW + q) * 32);
         }
-        sn[a][0] = moe_scale<Bits>(sp[a], g); sn[a][1] = moe_scale<Bits>(sp[a], g + 8);
-        sn2[a][0] = moe_scale<Bits>(sp[a], 16 + g); sn2[a][1] = moe_scale<Bits>(sp[a], 24 + g);
+        sn[a][0] = gs_raw<Bits>(sp[a], g); sn[a][1] = gs_raw<Bits>(sp[a], g + 8);
+        sn2[a][0] = gs_raw<Bits>(sp[a], 16 + g); sn2[a][1] = gs_raw<Bits>(sp[a], 24 + g);
     }
     for (int ks = 0; ks < NKS; ks++) {
         const int b = ks % NST;
@@ -226,11 +226,11 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
                 w[a][q] = wn[a][q]; wn[a][q] = wn2[a][q];
                 if (ks + 2 < NKS) wn2[a][q] = __ldg(qp[a] + (size_t)((ks + 2) * NW + q) * 32);
             }
-            sw0[a] = sn[a][0]; sw8[a] = sn[a][1];
+            sw0[a] = gs_f<Bits>(sn[a][0]); sw8[a] = gs_f<Bits>(sn[a][1]);
             sn[a][0] = sn2[a][0]; sn[a][1] = sn2[a][1];
             if (ks + 2 < NKS) {
-                sn2[a][0] = moe_scale<Bits>(sp[a], (ks + 2) * 16 + g);
-                sn2[a][1] = moe_scale<Bits>(sp[a], (ks + 2) * 16 + g + 8);
+                sn2[a][0] = gs_raw<Bits>(sp[a], (ks + 2) * 16 + g);
+                sn2[a][1] = gs_raw<Bits>(sp[a], (ks + 2) * 16 + g + 8);
             }
         }
         asm volatile("cp.async.wait_group %0;" ::"n"(NST - 2));
@@ -293,8 +293,59 @@ __device__ __forceinline__ void gu_q_job(const PfJob& pj, int rh, const int* __r
         }
     }
 }
-template <int Bits, int G, int WT = 2>  // WT = 1: two blocks per job (row halves)
+// INT4 prefill gate/up kernel as released with part 1 (the INT8 variant is k_moe_gu_q_w8 below)
+template <int G, int WT = 2>  // WT = 1: two blocks per job (row halves), ~half the registers (2 blocks / SM)
 __global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
+                                                     const int* __restrict__ tl, const float* __restrict__ wl,
+                                                     const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
+                                                     __half* __restrict__ act) {
+    static_assert(G == 64 || G == 128, "G");
+    __shared__ __align__(16) int8_t xs[GQ_NST][GQ_TT][GQ_KS];
+    __shared__ __align__(16) float2 ss[GQ_NST][GQ_TT][GQ_KS / G];
+    const int nj = *njobs;
+    for (int jb = (int)blockIdx.x; jb < nj * (3 - WT); jb += gridDim.x) {
+        const int job = nj - 1 - jb / (3 - WT), rh = jb % (3 - WT);
+        const PfJob pj = jobs[job];
+        switch ((pj.n + 7) >> 3) {
+            case 1: gu_q_job<G, 1, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 2: gu_q_job<G, 2, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 3: gu_q_job<G, 3, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 4: gu_q_job<G, 4, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 5: gu_q_job<G, 5, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 6: gu_q_job<G, 6, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 7: gu_q_job<G, 7, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            default: gu_q_job<G, 8, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+        }
+    }
+}
+template <int Bits, int G, int WT = 2>  // WT = 1: two blocks per job (row halves)
+
+// INT4 prefill gate/up kernel as released with part 1 (the INT8 variant is k_moe_gu_q_w8 below)
+template <int G, int WT = 2>  // WT = 1: two blocks per job (row halves), ~half the registers (2 blocks / SM)
+__global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
+                                                     const int* __restrict__ tl, const float* __restrict__ wl,
+                                                     const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
+                                                     __half* __restrict__ act) {
+    static_assert(G == 64 || G == 128, "G");
+    __shared__ __align__(16) int8_t xs[GQ_NST][GQ_TT][GQ_KS];
+    __shared__ __align__(16) float2 ss[GQ_NST][GQ_TT][GQ_KS / G];
+    const int nj = *njobs;
+    for (int jb = (int)blockIdx.x; jb < nj * (3 - WT); jb += gridDim.x) {
+        const int job = nj - 1 - jb / (3 - WT), rh = jb % (3 - WT);
+        const PfJob pj = jobs[job];
+        switch ((pj.n + 7) >> 3) {
+            case 1: gu_q_job<G, 1, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 2: gu_q_job<G, 2, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 3: gu_q_job<G, 3, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 4: gu_q_job<G, 4, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 5: gu_q_job<G, 5, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 6: gu_q_job<G, 6, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            case 7: gu_q_job<G, 7, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+            default: gu_q_job<G, 8, WT>(pj, rh, tl, wl, xq, xqs, act, xs, ss); break;
+        }
+    }
+}
+__global__ void __launch_bounds__(256, WT == 2 ? 1 : 2) k_moe_gu_q_w8(const PfJob* __restrict__ jobs, const int* __restrict__ njobs,
                                                      const int* __restrict__ tl, const float* __restrict__ wl,
                                                      const int8_t* __restrict__ xq, const float2* __restrict__ xqs,
                                                      __half* __restrict__ act) {

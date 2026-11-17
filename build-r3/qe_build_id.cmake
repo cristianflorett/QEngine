@@ -1,0 +1,27 @@
+set(id "${FORCED}")
+if(id STREQUAL "" OR id STREQUAL "unknown")
+  set(id "unknown")
+  execute_process(COMMAND git -C "${SRC}" rev-parse --show-toplevel OUTPUT_VARIABLE top
+                  OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET RESULT_VARIABLE rc)
+  if(rc EQUAL 0 AND top)
+    file(REAL_PATH "${top}" top)
+    file(REAL_PATH "${SRC}" src)
+    if(top STREQUAL src)  # the tree itself, not a repository it was unpacked into
+      execute_process(COMMAND git -C "${SRC}" rev-parse --short=7 HEAD OUTPUT_VARIABLE h
+                      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      execute_process(COMMAND git -C "${SRC}" status --porcelain -uno OUTPUT_VARIABLE d
+                      OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+      if(h)
+        set(id "${h}")
+        if(d)
+          string(APPEND id "-dirty")
+        endif()
+      endif()
+    endif()
+  endif()
+endif()
+file(MAKE_DIRECTORY "${OUT}/gen")
+file(WRITE "${OUT}/qe_build.txt.tmp" "${id}\n")
+file(WRITE "${OUT}/qe_build_id.h.tmp" "#define QE_BUILD_ID \"${id}\"\n")
+execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OUT}/qe_build.txt.tmp" "${OUT}/qe_build.txt")
+execute_process(COMMAND ${CMAKE_COMMAND} -E copy_if_different "${OUT}/qe_build_id.h.tmp" "${OUT}/gen/qe_build_id.h")

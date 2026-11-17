@@ -488,7 +488,10 @@ struct Checkpoint {
             for (const auto& e : std::filesystem::directory_iterator(directory)) {
                 const auto name=e.path().filename().string();
                 // real INT4 directories contain a stray ngram_int8.safetensors DIRECTORY: only regular files qualify
-                if (e.is_regular_file() && e.path().extension()==".safetensors" && name.rfind("mtp",0)!=0 && name!="model_mtp.safetensors") files.push_back(e.path().string());
+                // (that skip is part of the accepted format layer); every regular *.safetensors the released loader
+                // would open stays in the scan, model_mtp.safetensors included - an INT8 directory without manifest
+                // is refused by the format check below, exactly one file earlier
+                if (e.is_regular_file() && e.path().extension()==".safetensors" && name.rfind("mtp",0)!=0) files.push_back(e.path().string());
             }
             std::sort(files.begin(),files.end());
             if (files.empty()) throw std::runtime_error(directory+": no body safetensors files");
