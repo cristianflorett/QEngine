@@ -188,7 +188,7 @@ inline long long stored_shape_last_dim(const std::string& path, const Json& entr
     if (got != 8) fail(path,".weight_shape","readable stored shape","truncated payload");
     return last;
 }
-// Safetensors files reach the loader only through SafeTensors::open_strict_validated — one guarded
+// Manifest-backed safetensors files reach the loader through SafeTensors::open_strict_validated — one guarded
 // open per file, strict header parse from the mapped bytes exactly once, payload validated against
 // those same bytes and the tensor table indexed from THAT parsed object (returned for manifest
 // cross-checks). The former validate-then-reopen pair (ifstream strict parse + permissive
@@ -493,9 +493,9 @@ struct Checkpoint {
             std::sort(files.begin(),files.end());
             if (files.empty()) throw std::runtime_error(directory+": no body safetensors files");
             for (const auto& f:files) {
-                // One guarded open per file; the format detector inspects the very object the
-                // tensors were indexed from (strict parse of the mapped header, no second open)
-                const auto j=body.open_strict_validated(f,false);  // scan route: legacy symlink allowance
+                // Keep the legacy loader for manifest-less INT4. Detection reuses its parsed header
+                // without imposing manifest-only contiguity, dtype or header-cap checks.
+                const auto j=body.open(f);  // legacy header and payload semantics, including alignment gaps
                 for(const auto& t:j.obj) if(t.first.size()>14 && t.first.compare(t.first.size()-14,14,".weight_packed")==0) {
                     const auto base=t.first.substr(0,t.first.size()-14);
                     // The .weight_shape companion alone does NOT decide the format: compressed-tensors
@@ -526,12 +526,12 @@ struct Checkpoint {
                 }
             }
             if(want_mtp) {
-                if(!mtp_override.empty()) mtp.open_strict_validated(resolve_path(directory,mtp_override),false);
+                if(!mtp_override.empty()) mtp.open(resolve_path(directory,mtp_override));
                 else {
                     bool found=false;
                     for(const auto* name:{"mtp.safetensors","mtp-int4.safetensors"}) {
                         const auto f=resolve_path(directory,name);
-                        if(is_file(f)){mtp.open_strict_validated(f,false);found=true;}
+                        if(is_file(f)){mtp.open(f);found=true;}
                     }
                     if(!found) throw std::runtime_error(directory+": requested MTP checkpoint missing");
                 }
