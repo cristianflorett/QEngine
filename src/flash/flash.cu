@@ -1873,7 +1873,9 @@ void Worker::alloc_state() {
     kvs_ = kv_ram_mode();
     // (the RAM pool's lazy pinning, block cache and expert-cache tails are sized per card for all 13 KV layers; a stage
     // holds a few of them: not validated yet)
-    CHECK(!(kvs_ && p_.pp()), "flash: FLASH_KV=ram is not supported with pipeline stages (FLASH_PAR=pp / pp_prefill) yet; use FLASH_KV=vram");
+    CHECK(!(kvs_ && p_.pp() && !env_int("FLASH_KV_PP", 0)),
+          "flash: FLASH_KV=ram is not supported with pipeline stages (FLASH_PAR=pp / pp_prefill) yet; use FLASH_KV=vram "
+          "(FLASH_KV_PP=1 opts in, forced mode B only: auto / pp_prefill refuse it before the workers start)");
     if (kvs_) {
         // the pool (all conversations together) in host RAM: FLASH_KV_RAM_TOKENS (e.g. 10M) as the host-RAM plan fits it
         // (host_budget.h: next to the experts and the n-gram table, within MemAvailable - margin at start), and as a last
@@ -1884,6 +1886,7 @@ void Worker::alloc_state() {
             fprintf(stderr, "[flash] KV in RAM: %.2fM tokens asked, %.2fM tokens planned (host RAM plan: next to the experts and the "
                     "n-gram table within MemAvailable - margin)\n", asked / 1e6, want / 1e6);
         const double per_tok = kv_ram_tok_bytes() * p_.own / p_.period;  // host bytes per position on a card
+        // shortcut: sizing assumes 13 KV layers/rank; upgrade when ctx >262144 or host pressure
         // (less what the other load threads' pins in flight have not touched yet: MemAvailable does not lack it yet)
         static const long long cap_tok = (long long)(0.75 * std::max(0.0, (double)qe_hostmem::headroom(true) -
                                                                        (double)qe_hostmem::pin_untouched().load()) / p_.ngpu / per_tok);

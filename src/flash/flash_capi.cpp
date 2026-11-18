@@ -2804,11 +2804,18 @@ static void* qe_create_body(const char* model_dir, const char* devices, int max_
             return nullptr;
         }
         if (par == flash_pp::Par::PP && kv_ram_mode() && ndev > 3) {
-            refuse4(pptp ? "FLASH_PAR=pptp needs the KV in VRAM (FLASH_KV=ram is not supported by the pipeline stages)"
-                         : "FLASH_PAR=pp needs the KV in VRAM (FLASH_KV=ram is not supported by the pipeline stages)");
-            return nullptr;
+            if (!env_int("FLASH_KV_PP", 0)) {  // FLASH_KV_PP=1: opt-in for FLASH_KV=ram under FORCED mode B (pp / pptp);
+                // auto and pp_prefill keep their refusals above and below this block untouched
+                refuse4(pptp ? "FLASH_PAR=pptp needs the KV in VRAM (FLASH_KV=ram is not supported by the pipeline stages)"
+                             : "FLASH_PAR=pp needs the KV in VRAM (FLASH_KV=ram is not supported by the pipeline stages)");
+                return nullptr;
+            }
+            fprintf(stderr, "qflash: FLASH_KV_PP=1: KV in RAM under the pipeline stages is opt-in: the pool is still sized "
+                    "for all 13 KV layers on every rank (the machine total is right; per card it is oversized), keep the "
+                    "context at 262144 or below and watch the host RAM plan; auto and pp_prefill keep refusing it\n");
         }
-        if (par == flash_pp::Par::PP && kv_ram_mode()) {
+        if (par == flash_pp::Par::PP && kv_ram_mode() && ndev <= 3) {  // (the ndev > 3 case above either refused or took
+            // the opt-in; ≤3 keeps its old silent fallback to TP)
             fprintf(stderr, "qflash: FLASH_PAR=pp needs the KV in VRAM (FLASH_KV=ram is not supported by the pipeline stages): tp used\n");
             par = flash_pp::Par::TP;
             pptp = false;  // (review M1: the TP fallback must not keep the PP x TP set-up)
