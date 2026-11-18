@@ -1903,6 +1903,9 @@ void Worker::alloc_state() {
         // six ranks. The price is +25 % of pond budget on the light stages (a 1M-token pool plans 15.6 GB instead of
         // the exact 13.5); what a card really pins stays nq_own x 1,040 B/tok - a stage 0/1 card lands 2.08 GB of
         // the 2.6 it is charged, the last stage all 2.6. TP and mode A keep their 13-layer sizing byte for byte.
+        // R5c: why worst-nq here and not each rank's nq_own - rows_ and cap_tok are engine-wide (admission min,
+        // W[0] anchor): per-rank charging would compute six different caps and diverge the pool. The uniform +25 %
+        // on the light stages is the cheap insurance that keeps rows_ one value on every rank.
         const double nq_pool = g_kv_worst_nq > 0 ? (double)g_kv_worst_nq : kv_nq_own(p_);
         const double per_tok = nq_pool * kv_layer_tok_bytes() * p_.own / p_.period;  // host bytes per position on a card
         // (less what the other load threads' pins in flight have not touched yet: MemAvailable does not lack it yet)
@@ -2510,10 +2513,13 @@ void Worker::alloc_state() {
             kvs_host_ = (size_t)r1 * rowb;
             kvh_pinned_ = kvh_min_ = r1;
         }
-        fprintf(stderr, "[flash] GPU%d KV in RAM: pool %d rows (%lld positions, %.2f GB host%s), block cache %d x 4 rows per layer (%.0f MB), indexer keys %.0f MB\n",
+        fprintf(stderr, "[flash] GPU%d KV in RAM: pool %d rows (%lld positions, %.2f GB host%s), block cache %d x 4 rows per layer (%.0f MB), indexer keys %.0f MB, nq_pool %.0f (%.0f B/pos%s)\n",
                 dev_, rows_, (long long)rows_ / p_.own * p_.period, (double)rows_ * kv_nq_own(p_) * kv_layer_tok_bytes() / 1e9,
                 kvh_lazy_ ? ", pinned as used" : ", pinned at start", kvs_P_,
-                kvs_P_ * IDX_R * kv_layer_tok_bytes() / 1e6, kv_nq_own(p_) * rows_ / IDX_R * IDX_HD * 2 / 1e6);
+                kvs_P_ * IDX_R * kv_layer_tok_bytes() / 1e6, kv_nq_own(p_) * rows_ / IDX_R * IDX_HD * 2 / 1e6,
+                g_kv_worst_nq > 0 ? (double)g_kv_worst_nq : kv_nq_own(p_),   // R5a: the pool geometry as the clamp applied it
+                (g_kv_worst_nq > 0 ? (double)g_kv_worst_nq : kv_nq_own(p_)) * kv_layer_tok_bytes() * p_.own / p_.period,
+                g_kv_worst_nq > 0 ? ", worst-nq clamp" : "");                // the applied cap is rows_/positions, printed above
     }
 }
 
