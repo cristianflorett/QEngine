@@ -1686,6 +1686,8 @@ constexpr long long kKvRamDefaultTokens = 1000000;
 static long long g_kv_ram_plan = -1;
 void set_kv_ram_plan(long long tokens) { g_kv_ram_plan = tokens; }
 long long kv_ram_plan() { return g_kv_ram_plan; }
+static int g_kv_worst_nq = 0;
+void set_kv_worst_nq(int n) { g_kv_worst_nq = n; }  // the pipeline pool clamp (Worker::alloc_state)
 long long kv_ram_tokens() {
     // empty = unset (src/env.h); a value that does not parse (no number, junk after the k/M/G suffix): warning + default
     auto num = [](const char* v, double* x) {
@@ -1863,6 +1865,13 @@ void Worker::use(const Bufs& b) {
     brows_ = b.rows;
 }
 
+// KV layers on a card: 13 for a TP rank or mode A (their pool rows are everywhere); under FLASH_KV=ram in forced
+// mode B (FLASH_KV_PP): the stage's QSA layers + the MTP block on the last stage (stage_nq, pp_plan.h: 4|4|5 on
+// three stages). The host pool, the indexer keys' sizing and their logs use this instead of the hard 13.
+static double kv_nq_own(const Plan& p) {
+    return p.pp() ? (double)flash_pp::stage_nq(p.stage, p.nstage, p.l0, p.l1)
+                  : (double)(flash_pp::kLayers / flash_pp::kQsaEvery + 1);  // the 12 QSA + MTP: derived, not a literal
+}
 void Worker::alloc_state() {
     CUDA_CHECK(cudaSetDevice(dev_));
     // owned KV rows for max_ctx positions
@@ -1871,8 +1880,8 @@ void Worker::alloc_state() {
     // KV streaming (FLASH_KV_STREAM=1): the pool of FLASH_KV_STREAM_CTX positions (default 1M) lives in host memory,
     // VRAM keeps the indexer keys of the pool + a block cache of FLASH_KV_CACHE_BLOCKS blocks of 4 rows per layer
     kvs_ = kv_ram_mode();
-    // (the RAM pool's lazy pinning, block cache and expert-cache tails are sized per card for all 13 KV layers; a stage
-    // holds a few of them: not validated yet)
+    // (the RAM pool's block cache and expert-cache tails are sized per card for the stage's own KV layers under
+    // FLASH_KV_PP; the TP and mode A layouts size for all 13 as ever)
     CHECK(!(kvs_ && p_.pp() && !env_int("FLASH_KV_PP", 0)),
           "flash: FLASH_KV=ram is not supported with pipeline stages (FLASH_PAR=pp / pp_prefill) yet; use FLASH_KV=vram "
           "(FLASH_KV_PP=1 opts in, forced mode B only: auto / pp_prefill refuse it before the workers start)");
@@ -1885,11 +1894,23 @@ void Worker::alloc_state() {
         if (want < asked && p_.rank == 0)
             fprintf(stderr, "[flash] KV in RAM: %.2fM tokens asked, %.2fM tokens planned (host RAM plan: next to the experts and the "
                     "n-gram table within MemAvailable - margin)\n", asked / 1e6, want / 1e6);
-        const double per_tok = kv_ram_tok_bytes() * p_.own / p_.period;  // host bytes per position on a card
-        // shortcut: sizing assumes 13 KV layers/rank; upgrade when ctx >262144 or host pressure
+        // FLASH_KV=ram under a pipeline stage (FLASH_KV_PP, forced mode B): a rank's pool array holds the rows of its
+        // stage's KV layers only (stage_nq: 4|4|5 on three stages), but the pool ROWS are a cross-rank invariant of
+        // the engine: the admission min over the ranks' kv_ram_periods (flash_capi.cpp:831, :5596) and the host-file
+        // anchor over W[0] (:3652) read ONE uniform pool, and ranks of a stage share every position by construction.
+        // So the per-position bytes are clamped to the WORST stage of the plan (set_kv_worst_nq: the max stage_nq
+        // over the bounds, 5 on TP2xPP3 -> one 2,600 B/tok charge per TP2 card): one cap_tok, identical rows_ on the
+        // six ranks. The price is +25 % of pond budget on the light stages (a 1M-token pool plans 15.6 GB instead of
+        // the exact 13.5); what a card really pins stays nq_own x 1,040 B/tok - a stage 0/1 card lands 2.08 GB of
+        // the 2.6 it is charged, the last stage all 2.6. TP and mode A keep their 13-layer sizing byte for byte.
+        const double nq_pool = g_kv_worst_nq > 0 ? (double)g_kv_worst_nq : kv_nq_own(p_);
+        const double per_tok = nq_pool * kv_layer_tok_bytes() * p_.own / p_.period;  // host bytes per position on a card
         // (less what the other load threads' pins in flight have not touched yet: MemAvailable does not lack it yet)
+        // static, as in b7f51a371: per_tok is now one value per process, so the cap the first loader thread computes
+        // is the cap every thread gets (the C++11 magic static) - no per-thread drift of headroom / pin_untouched
+        // between the concurrent alloc_state calls can split the pools of one engine (review F1 + F2).
         static const long long cap_tok = (long long)(0.75 * std::max(0.0, (double)qe_hostmem::headroom(true) -
-                                                                       (double)qe_hostmem::pin_untouched().load()) / p_.ngpu / per_tok);
+                                                              (double)qe_hostmem::pin_untouched().load()) / p_.ngpu / per_tok);
         long long pc = std::max<long long>(max_ctx_, std::min(want, cap_tok));
         // 16384 (was 8192): a lone 262K prompt on 2 GPUs 111-139 s -> 57 s (VRAM mode 58 s); entries beyond the active
         // contexts stay with the expert cache (set_kv_active), so the size costs VRAM only while long contexts run
@@ -1900,8 +1921,8 @@ void Worker::alloc_state() {
         if (p_.rank == 0)
             fprintf(stderr, "[flash] KV in RAM: %.2fM tokens = ~%.1f GB pinned (all conversations together), max %d per conversation; "
                     "VRAM: %.0f MB indexer keys + %.0f MB block cache per card\n",
-                    pc / 1e6, pc * kv_ram_tok_bytes() / 1e9, max_ctx_, pc * 13.0 * IDX_HD * 2 / IDX_R * p_.own / p_.period / 1e6,
-                    kvs_P_ * IDX_R * kv_ram_tok_bytes() / 1e6);
+                    pc / 1e6, pc * kv_ram_tok_bytes() / 1e9, max_ctx_, pc * kv_nq_own(p_) * IDX_HD * 2 / IDX_R * p_.own / p_.period / 1e6,
+                    kvs_P_ * IDX_R * kv_nq_own(p_) * kv_layer_tok_bytes() / 1e6);
         if (pc > 2000000000LL / p_.own * p_.period / 4) pc = 2000000000LL / p_.own * p_.period / 4;  // int rows / blocks
         rows_ = (int)((pc + p_.period - 1) / p_.period) * p_.own;
         // FLASH_KV_RAM_LAZY=1: pin as the pool fills (needs registered host memory at its host address on the device);
@@ -2490,9 +2511,9 @@ void Worker::alloc_state() {
             kvh_pinned_ = kvh_min_ = r1;
         }
         fprintf(stderr, "[flash] GPU%d KV in RAM: pool %d rows (%lld positions, %.2f GB host%s), block cache %d x 4 rows per layer (%.0f MB), indexer keys %.0f MB\n",
-                dev_, rows_, (long long)rows_ / p_.own * p_.period, (double)rows_ * kv_ram_tok_bytes() / 1e9,
+                dev_, rows_, (long long)rows_ / p_.own * p_.period, (double)rows_ * kv_nq_own(p_) * kv_layer_tok_bytes() / 1e9,
                 kvh_lazy_ ? ", pinned as used" : ", pinned at start", kvs_P_,
-                kvs_P_ * IDX_R * kv_ram_tok_bytes() / 1e6, 13.0 * rows_ / IDX_R * IDX_HD * 2 / 1e6);
+                kvs_P_ * IDX_R * kv_layer_tok_bytes() / 1e6, kv_nq_own(p_) * rows_ / IDX_R * IDX_HD * 2 / 1e6);
     }
 }
 
@@ -8160,7 +8181,7 @@ void Worker::kvs_set_pe(int pe) {
         logged = pe;
         if (p_.rank == 0)
             fprintf(stderr, "[flash] KV in RAM: block cache in use %d of %d blocks (%.0f of %.0f MB per card)\n", pe, kvs_P_,
-                    pe * IDX_R * kv_ram_tok_bytes() / 1e6, kvs_P_ * IDX_R * kv_ram_tok_bytes() / 1e6);
+                    pe * IDX_R * kv_nq_own(p_) * kv_layer_tok_bytes() / 1e6, kvs_P_ * IDX_R * kv_nq_own(p_) * kv_layer_tok_bytes() / 1e6);
     }
 }
 

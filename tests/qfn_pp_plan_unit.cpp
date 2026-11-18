@@ -182,6 +182,63 @@ int main() {
         EXPECT(decode_ngroups(3, 3) == 3);  // c = n: every stage one group
     }
 
+    // ---- stage_nq: KV layers per stage for the FLASH_KV=ram pool under a pipeline (ctx > 262144): the QSA layers
+    // of the stage's range (3, 7, ..., 47) + the MTP block's layer, which loads on the last stage only. The even
+    // 16|16|16 split and its +-1 / +-2 shifts that keep every bound inside a DeltaNet gap (17|16|15, 18|15|15 -
+    // the engine's uneven auto partitions): every one gives 4|4|5 and sums to the machine's 13.
+    {
+        const int splits[3][3] = {{16, 16, 16}, {17, 16, 15}, {18, 15, 15}};
+        for (const auto& sp : splits) {
+            const int b[4] = {0, sp[0], sp[0] + sp[1], flash_pp::kLayers};
+            EXPECT(b[3] == 48);
+            EXPECT(stage_nq(0, 3, b[0], b[1]) == 4);
+            EXPECT(stage_nq(1, 3, b[1], b[2]) == 4);
+            EXPECT(stage_nq(2, 3, b[2], b[3]) == 5);  // the MTP layer's pool rows live on the last stage
+            EXPECT(stage_nq(0, 3, b[0], b[1]) + stage_nq(1, 3, b[1], b[2]) + stage_nq(2, 3, b[2], b[3]) ==
+                   flash_pp::kLayers / flash_pp::kQsaEvery + 1);  // the same 13 a TP card holds
+        }
+        EXPECT(stage_nq(3, 3, 0, 48) == 13);   // a stage index out of the pipeline: the TP fallback 13
+        EXPECT(stage_nq(-1, 3, 0, 48) == 13);  // (mode A's TP decode ranks size this way too)
+        EXPECT(stage_nq(0, 1, 0, 48) == 13);   // no pipeline: the 12 QSA + MTP on the single card
+        // pool bytes per token: one KV layer = kv_layer_bytes() = 1,040 B fp8 for the whole machine (flash.h); a TP2
+        // stage rank holds half its stage's: 4 x 520 B/tok on stages 0-1, 5 x 520 on the last; both ranks of a stage
+        // together: nq x 1,040 B/tok (the host-RAM plan of flash_capi keeps asking the 13-layer machine total)
+        EXPECT(near_(stage_nq(0, 3, 0, 16) * kv_layer_bytes() / 2, 4 * 520.0));
+        EXPECT(near_(stage_nq(2, 3, 32, 48) * kv_layer_bytes() / 2, 5 * 520.0));
+        EXPECT(near_(stage_nq(2, 3, 32, 48) * kv_layer_bytes(), 5 * 1040.0));
+    }
+
+    // ---- stage_nq on TWO stages (PP2xTP2, the four-card experiment) and over EVERY partition of the layer line:
+    // 24|24 splits the QSA layers 6|6 and the MTP layer tips the last stage to 7; and however the two cuts of a
+    // three-stage split fall (every pair 1..47, degenerate ranges included) the whole pipeline still holds the 13
+    // KV layers a TP card holds - the clamp's worst stage and the machine total read this same arithmetic.
+    {
+        EXPECT(stage_nq(0, 2, 0, 24) == 6);
+        EXPECT(stage_nq(1, 2, 24, flash_pp::kLayers) == 7);  // 6 QSA + the MTP layer
+        for (int a = 1; a < flash_pp::kLayers - 1; a++)
+            for (int b = a + 1; b < flash_pp::kLayers; b++)
+                EXPECT(stage_nq(0, 3, 0, a) + stage_nq(1, 3, a, b) + stage_nq(2, 3, b, flash_pp::kLayers) ==
+                       flash_pp::kLayers / flash_pp::kQsaEvery + 1);
+    }
+
+    // ---- the pool-uniformity invariant (review F1 / F2): the pool ROWS are ONE object shared by all six ranks -
+    // admission is the min of the ranks' kv_ram_periods and the file anchor reads W[0] - so two ranks of the same
+    // stage MUST see the same cap_tok, and under the worst-nq clamp so MUST the six. alloc_state charges every rank
+    // the plan's worst stage_nq, which makes the per-position bytes stage-independent: one 2,600 B/tok TP2 charge
+    // (5 x 1,040 / 2) pays for identical rows everywhere, while what a card really pins stays its own: 2,080 B/tok
+    // on the 4-layer stages, 2,600 on the last. The clamp covers every stage because worst >= every own nq.
+    {
+        const int b[4] = {0, 16, 32, flash_pp::kLayers};  // the even TP2xPP3 split (and any other gives the same)
+        int worst = 0;
+        for (int s = 0; s < 3; s++) worst = std::max(worst, stage_nq(s, 3, b[s], b[s + 1]));
+        EXPECT(worst == 5);
+        for (int s = 0; s < 3; s++)
+            EXPECT(worst >= stage_nq(s, 3, b[s], b[s + 1]));  // identical rows fit the heaviest stage's array
+        EXPECT(near_(worst * kv_layer_bytes() / 2, 2600.0));  // the one charge every rank's cap is computed from
+        EXPECT(near_(stage_nq(0, 3, b[0], b[1]) * kv_layer_bytes() / 2, 2080.0));  // stage 0 pins less than charged
+        EXPECT(near_(stage_nq(2, 3, b[2], b[3]) * kv_layer_bytes() / 2, 2600.0));  // the last stage pins all of it
+    }
+
     if (fails) {
         fprintf(stderr, "QFN-PP-PLAN-UNIT: FAIL (%d checks failed)\n", fails);
         return 1;

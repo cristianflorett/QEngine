@@ -2810,9 +2810,12 @@ static void* qe_create_body(const char* model_dir, const char* devices, int max_
                              : "FLASH_PAR=pp needs the KV in VRAM (FLASH_KV=ram is not supported by the pipeline stages)");
                 return nullptr;
             }
-            fprintf(stderr, "qflash: FLASH_KV_PP=1: KV in RAM under the pipeline stages is opt-in: the pool is still sized "
-                    "for all 13 KV layers on every rank (the machine total is right; per card it is oversized), keep the "
-                    "context at 262144 or below and watch the host RAM plan; auto and pp_prefill keep refusing it\n");
+            fprintf(stderr, "qflash: FLASH_KV_PP=1: KV in RAM under the pipeline stages is opt-in (forced mode B on 4+ "
+                    "cards; pp / pptp on 2-3 cards keeps its old fallback to TP): the pool is sized per stage (stage_nq: "
+                    "the stage's QSA layers + MTP on the last, 4|4|5 on TP2xPP3; the per-position bytes clamp to the "
+                    "worst stage so all ranks keep identical pool rows), the machine total stays the 13-layer one the "
+                    "host RAM plan budgets; keep the context at 262144 or below and watch the host RAM plan; auto and "
+                    "pp_prefill keep refusing it\n");
         }
         if (par == flash_pp::Par::PP && kv_ram_mode() && ndev <= 3) {  // (the ndev > 3 case above either refused or took
             // the opt-in; ≤3 keeps its old silent fallback to TP)
@@ -3032,6 +3035,7 @@ static void* qe_create_body(const char* model_dir, const char* devices, int max_
         in.arch_env = "FLASH_KV_ARCHIVE_GB";
         in.pref_env = "FLASH_PREFIX_GB";
         set_kv_ram_plan(-1);  // (a second engine in the process starts from the request again, review L6)
+        set_kv_worst_nq(0);   // (same for the pipeline pool clamp)
         if (kv_ram_mode()) {  // the KV pool in host RAM, pinned at start (club-3090 #1966: it was not in the plan)
             const double w = (double)e->ctx, seats = (double)std::clamp(env_int("FLASH_MAX_SEQS", 16), 1, 16);
             in.kv_tok = kv_ram_tok_bytes();
@@ -3459,6 +3463,13 @@ static void* qe_create_body(const char* model_dir, const char* devices, int max_
         e->ppb_bounds = pptp ? pptp_bounds(groups, env_ll("FLASH_PPB_SPLIT_CTX", 32768), &err, weight_group_bytes(e->checkpoint.format))
                              : pp_bounds(e->ng, env_ll("FLASH_PPB_SPLIT_CTX", 32768), true, &err, weight_group_bytes(e->checkpoint.format));
         if (e->ppb_bounds.empty()) { fprintf(stderr, "qflash: %s\n", err.c_str()); return nullptr; }
+        if (kv_ram_mode() && env_int("FLASH_KV_PP", 0)) {  // the pool rows are a cross-rank invariant (Worker::
+            int worst = 0;                                 // alloc_state, flash.cu): bill every rank the heaviest
+            for (int s = 0; s + 1 < (int)e->ppb_bounds.size(); s++)  // stage's KV layers, so one cap_tok and one
+                worst = std::max(worst, flash_pp::stage_nq(s, (int)e->ppb_bounds.size() - 1,  // rows_ serve all the
+                                                           e->ppb_bounds[s], e->ppb_bounds[s + 1]));           // ranks alike
+            set_kv_worst_nq(worst);                        // (0 without the opt-in: ranks size on their own nq)
+        }
         ng_done.wait();  // (the stages size their expert budgets at load: after the host registrations)
         std::vector<int> tps;
         if (pptp) {  // PP x TP: every rank of every stage (the server's workers W, ng = all of them)
