@@ -89,48 +89,7 @@ static void compare(const std::vector<float>& actual,const std::vector<float>& e
     require(relative<=tolerance,"CPU oracle mismatch");
 }
 static float half_round(float v) { return __half2float(__float2half_rn(v)); }
-static void plan_checks() {
-    flash_pp::PickIn pick{};
-    pick.n=5;
-    require(flash_pp::pick_par(pick).par==flash_pp::Par::PP,"automatic five-card policy must remain PP");
-    flash_pp::Par explicit_mode;
-    require(flash_pp::parse_par("tp",&explicit_mode) && explicit_mode==flash_pp::Par::TP,
-            "explicit TP must not silently become PP");
-    require(flash_pp::comm_wanted(5,explicit_mode,false,false),"explicit TP5 must allocate rank communication");
-    for(int n=1;n<=5;++n) {
-        const auto plans=make_plan(n,std::vector<double>(n,1.0));
-        std::vector<int> qs(NQ),vs(LNV),voc(VOCAB),groups((NE+1)*NGRP);
-        for(int r=0;r<n;++r) {
-            const Plan& p=plans[r];
-            require(p.q0==q_begin(r,n) && p.q1==q_end(r,n),"Q plan/helpers disagree");
-            require(p.v0==v_begin(r,n) && p.v1==v_end(r,n),"V plan/helpers disagree");
-            require(p.k0==k_begin(r,n) && p.k1==k_end(r,n),"K plan/helpers disagree");
-            require(q_count(r,n)<=q_capacity(n),"head exceeds padded capacity");
-            if(n<5) require(q_count(r,n)==NQ/n,"TP1-4 Q split changed");
-            for(int h=p.q0;h<p.q1;++h) { ++qs[h]; require(q_owner(h,n)==r,"Q owner inverse"); }
-            require(p.voc0>=0 && p.voc1<=VOCAB && p.voc0%128==0 && p.voc1%128==0,"unaligned/out-of-range vocab partition");
-            for(int word=p.voc0;word<p.voc1;++word) ++voc[word];
-            for(int h=p.v0;h<p.v1;++h) { ++vs[h]; require(h/3>=p.k0 && h/3<p.k1,"value maps outside local keys"); }
-            for(size_t g=0;g<groups.size();++g) if(p.gcard[g]==r) ++groups[g];
-            if(n==5) require(plan_groups(p)==513,"TP5 must assign 513 expert groups/rank");
-        }
-        for(int count:qs) require(count==1,"Q split gap/overlap");
-        for(int count:vs) require(count==1,"V split gap/overlap");
-        for(int count:groups) require(count==1,"expert split gap/overlap");
-        for(int count:voc) require(count==1,"vocab split gap/overlap");
-    }
-    for(int n:{0,6}) { bool rejected=false; try { make_plan(n,std::vector<double>(n,1)); } catch(const std::runtime_error&) { rejected=true; } require(rejected,"invalid TP count accepted"); }
-    unsigned used=0;
-    for(int r=0;r<5;++r) for(int o=0;o<5;++o) {
-        const unsigned bit=comm_pair_bit(r,o);
-        require(bit<32,"pair bit index exceeds unsigned"); require(!(used&(1u<<bit)),"pair index collision"); used|=1u<<bit;
-        if(r<4 && o<4) require(bit==unsigned(4*r+o),"legacy TP4 pair index changed");
-    }
-    require(used==((1u<<25)-1),"pair mask must cover 25 distinct bits");
-    const int boundaries[]={4,9,14,19,23};
-    const int owners[]={1,2,3,4,4};
-    for(int i=0;i<5;++i) require(q_owner(boundaries[i],5)==owners[i],"TP5 boundary head ownership");
-}
+#include "tp5_plan_checks.h"  // plan_checks(): the CPU part, also built standalone as flash_tp5_plan_unit
 struct CollectiveRank {
     Device<float> input,residual,gather,ss;
     Device<unsigned> seq,done,go,bar,epoch,ready;
@@ -175,6 +134,79 @@ static void collective_checks(int n) {
         }
     }
     ranks.clear(); CUDA_CHECK(cudaFreeHost(c.ll)); CUDA_CHECK(cudaFreeHost(c.data)); CUDA_CHECK(cudaFreeHost(c.flags));
+}
+// Fifth-rank coverage for the HC all-reduce: allreduce_add_hc on a P2P comm whose every directed pair
+// pulls (c.pullm set bit comm_pair_bit(reader, owner)) runs allreduce_hc_pull_kernel - its per-element
+// loop folds the rank-4 loads (the g < c.ngpu arm of the pull) - a route the host-staged LL fixture
+// above never reaches. R += inj * allreduce(partial) per row; the partials are bf16-exact small
+// integers, so the fixed-order sum is exact and the fp32 oracle needs no slack. Rank 4 carries the
+// heaviest term: an all-reduce that lost the fifth peer's pull differs from the oracle by a fifth.
+struct HcPullRank {
+    Device<float> R,inj,partial,ss;
+    Device<unsigned> seq,done,go,bar,epoch,ready;
+    CommCounters ctr{};
+    Graph graph;
+    HcPullRank(int m,int h):R(size_t(m)*4*h),inj(size_t(m)*4),partial(size_t(m)*h),ss(kCommBlocks*kMaxBatchRows),
+        seq(1),done(2),go(1),bar(2),epoch(1),ready(4096) {
+        R.zero(); inj.zero(); partial.zero(); ss.zero();
+        seq.zero(); done.zero(); go.zero(); bar.zero(); epoch.zero(); ready.zero();
+        ctr.seq=seq.p; ctr.done=done.p; ctr.go=go.p; ctr.bar=bar.p; ctr.ss=ss.p; ctr.epoch=epoch.p; ctr.ready=ready.p;
+    }
+    void check() { R.check(); inj.check(); partial.check(); ss.check(); seq.check(); done.check(); go.check(); bar.check(); epoch.check(); ready.check(); }
+};
+static void hc_pull_checks(int n) {
+    constexpr int h=256,m=64;  // m >= 3n, m > kMaxGemvW4Tokens, m <= rs_rows = max_elems/ll_hidden
+    std::vector<int> devs(n);
+    for(int r=0;r<n;++r) devs[r]=r;
+    Comm c=comm_create(n,m*h,h);
+    if(!comm_enable_p2p(c,devs.data())) {  // the pull kernel is the P2P route: without peer access between
+        std::printf("flash_tp5_unit: topology-skip: no P2P for the HC pull fixture\n");  // these cards it is the
+        std::exit(77);                                                                    // same explicit skip
+    }
+    c.pullm=0;
+    for(int reader=0;reader<n;++reader)
+        for(int owner=0;owner<n;++owner)
+            if(reader!=owner) c.pullm|=1u<<comm_pair_bit(reader,owner);  // every pair pulls: the fifth peer's loads run
+    std::vector<std::unique_ptr<HcPullRank>> ranks;
+    for(int r=0;r<n;++r) { CUDA_CHECK(cudaSetDevice(r)); ranks.emplace_back(new HcPullRank(m,h)); }
+    for(int r=0;r<n;++r) {
+        CUDA_CHECK(cudaSetDevice(r)); auto& x=*ranks[r];
+        comm_bind_ll_scrub(x.ctr,c,r);
+        x.graph.capture([&](cudaStream_t st) {
+            comm_begin_unit(x.ctr,st);
+            require(allreduce_add_hc(x.R.p,x.inj.p,x.partial.p,m,h,c,r,x.ctr,st,16),
+                    "the HC pull fixture shape was refused by allreduce_hc_ok");
+        });
+    }
+    std::vector<float> inj(size_t(m)*4);
+    for(size_t i=0;i<inj.size();++i) inj[i]=1.f+0.25f*float(i%4);
+    for(int unit=0;unit<3;++unit) {
+        std::vector<float> sum(size_t(m)*h),first_four(size_t(m)*h,0.f);
+        for(int r=0;r<n;++r) {
+            CUDA_CHECK(cudaSetDevice(r));
+            std::vector<float> partial(size_t(m)*h);
+            for(size_t i=0;i<partial.size();++i) partial[i]=float(8*(r+1)+int(i%7)+unit);  // rank 4 sits highest
+            ranks[r]->R.zero();
+            ranks[r]->partial.put(partial); ranks[r]->inj.put(inj);
+            for(size_t i=0;i<partial.size();++i) { sum[i]+=partial[i]; if(r<4) first_four[i]+=partial[i]; }
+        }
+        for(auto& x:ranks) x->graph.run();
+        for(auto& x:ranks) x->graph.sync();
+        if(n==5) require(sum[0]-first_four[0]>0.f,"the HC oracle does not cover a substantial fifth-rank pull");
+        for(int r=0;r<n;++r) {
+            CUDA_CHECK(cudaSetDevice(r));
+            std::vector<float> expected(size_t(m)*4*h);
+            for(int row=0;row<m;++row)
+                for(int s4=0;s4<4;++s4)
+                    for(int d=0;d<h;++d)
+                        expected[(size_t(row)*4+s4)*h+d]=inj[size_t(row)*4+s4]*sum[size_t(row)*h+d];
+            compare(ranks[r]->R.get(),expected,1e-4);
+            ranks[r]->check();
+        }
+    }
+    ranks.clear();
+    comm_free_p2p(c,devs.data());
+    CUDA_CHECK(cudaFreeHost(c.ll)); CUDA_CHECK(cudaFreeHost(c.data)); CUDA_CHECK(cudaFreeHost(c.flags));
 }
 enum class Exchange { Q32,Q16,Local16,Partial32,Partial16 };
 struct ExchangeRank {
@@ -433,9 +465,14 @@ int main(int argc,char** argv) {
     }
     try {
         plan_checks();
-        int count=0; CUDA_CHECK(cudaGetDeviceCount(&count)); require(count>=n,"not enough distinct CUDA devices for requested ranks");
+        int count=0; CUDA_CHECK(cudaGetDeviceCount(&count));
+        if(count<n) {  // an explicit topology skip (exit 77), not a failure: the machine simply has no fifth card
+            std::printf("flash_tp5_unit: topology-skip: %d CUDA device(s), %d ranks requested\n",count,n);
+            return 77;
+        }
         for(int r=0;r<n;++r) { CUDA_CHECK(cudaSetDevice(r)); cudaDeviceProp prop{}; CUDA_CHECK(cudaGetDeviceProperties(&prop,r)); require(prop.canMapHostMemory,"host-mapped communication unavailable"); std::printf("rank %d: CUDA device %d %s\n",r,r,prop.name); }
         collective_checks(n);
+        hc_pull_checks(n);
         static_assert(XP16==HD/2+4,"the partial FP16 record is the released layout: HD halves + max + sum + pad (16-byte aligned)");
         for(Exchange mode:{Exchange::Q32,Exchange::Q16,Exchange::Local16,Exchange::Partial32,Exchange::Partial16}) exchange_checks(n,small?3:17,mode);
         const auto plans=make_plan(n,std::vector<double>(n,1.0));
@@ -453,8 +490,8 @@ int main(int argc,char** argv) {
             worker.join();
             if(failure) std::rethrow_exception(failure);
         }
-        std::printf("flash_tp5_unit: %d real ranks, host LL reduce/gather 70 graph units, FP32/FP16 staged exchanges, DeltaNet passed\n",n);
-        std::printf("P2P-specific transport not exercised: host-staged fixture selected\n");
+        std::printf("flash_tp5_unit: %d real ranks, host LL reduce/gather 70 graph units, HC pull all-reduce (P2P, every pair pulling), FP32/FP16 staged exchanges, DeltaNet passed\n",n);
+        std::printf("P2P transport exercised by the HC pull fixture only; the LL reduce/gather fixture stays host-staged\n");
         return 0;
     } catch(const std::exception& e) { std::fprintf(stderr,"flash_tp5_unit: %s\n",e.what()); return 1; }
 }
