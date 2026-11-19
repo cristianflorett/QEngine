@@ -127,6 +127,9 @@ inline double kv_layer_tok_bytes() { return (double)NKV * 2 * (kv_hb() + 4 * kv_
 inline double kv_ram_tok_bytes() { return 13.0 * kv_layer_tok_bytes(); }
 // the pool the host-RAM plan gives (tokens, host_budget.h; < 0: FLASH_KV_RAM_TOKENS as asked); set before the Workers are made
 void set_kv_ram_plan(long long tokens);
+// FLASH_KV=ram under a pipeline (FLASH_KV_PP): the worst stage_nq over the plan's bounds, so every rank sizes the
+// same pool rows (set with the bounds, before the Workers are made; 0: no clamp, the rank sizes on its own nq_own)
+void set_kv_worst_nq(int n);
 extern LoadDrop g_load_drop;  // load-time page cache of the layer files (safetensors.h), set up by qe_create
 long long kv_ram_plan();
 // YaRN RoPE scaling (opt-in; model card: rope_type yarn, factor 4.0, original_max_position_embeddings 262144):

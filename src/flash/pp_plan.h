@@ -52,6 +52,17 @@ constexpr int kRW = 4 * 2560;  // the hyper-connection residual row (4 streams x
 constexpr double kHopBytesPerRow = (double)kRW * 4;  // fp32: 40,960 B per token per boundary
 inline bool is_qsa(int li) { return li % kQsaEvery == kQsaEvery - 1; }
 
+// KV layers owned by a rank in mode B: the QSA layers of the stage's layer range, plus the MTP block's own QSA
+// layer on the last stage (the block is loaded there only, flash.cu). Across the whole pipeline the same 13 a TP
+// card holds: 4|4|5 on three stages, 6|7 on two. A stage index outside the pipeline is not a pipeline rank: 13
+// (TP card, mode A's TP decode). The FLASH_KV=ram pool of a stage rank holds rows for these layers only.
+inline int stage_nq(int stage, int nstage, int l0, int l1) {
+    if (stage < 0 || stage >= nstage) return kLayers / kQsaEvery + 1;
+    int n = 0;
+    for (int li = l0; li < l1; li++) n += is_qsa(li) ? 1 : 0;
+    return n + (stage == nstage - 1 ? 1 : 0);
+}
+
 // Bytes of the checkpoint as the engine lays it out (sizes from the loader: one 128-wide expert group is 506,880 B
 // at INT4 and 998,400 B at INT8 (flash.h ExpertLayout), 513 experts x 5 groups per layer; dense parts from the
 // per-card numbers of the PP=2 gate, scaled to the whole layer). The default construction is the INT4 checkpoint;
