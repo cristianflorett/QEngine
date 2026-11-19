@@ -617,32 +617,76 @@ int main(int argc, char** argv) {
             fs::create_directories(legacy/"ngram_int8.safetensors");
             { Checkpoint ck; ck.open(legacy.string(),false,"");
               require(!ck.has_manifest && ck.format==WeightFormat::Int4,"INT4 directory route changed"); }
+            { // manifest existence is probed with symlink_status, so a DANGLING symlink named
+              // qfn-int8-manifest.json is not "no manifest": the packed INT8 directory (the bug: it fell
+              // through to the scan route and died on the width discriminator "requires
+              // qfn-int8-manifest.json") and the otherwise-valid INT4 directory (it scanned as if the
+              // reserved name were absent) are both rejected by the symlink gate instead, and only a
+              // true absence keeps the scan route.
+                const auto dangling_manifest=[&](const fs::path& d,bool packed8){
+                    fs::create_directories(d);
+                    if (packed8) matrix_file(d/"model.safetensors"); else int4(d/"model-00001-of-00001.safetensors");
+                    fs::create_symlink("no-such-manifest.json",d/"qfn-int8-manifest.json");
+                    bool via_symlink_gate=false;
+                    try { Checkpoint ck; ck.open(d.string(),false,""); }
+                    catch(const std::runtime_error& e){ const std::string m=e.what();
+                        via_symlink_gate = m.find("symbolic link")!=std::string::npos &&
+                                           m.find("requires qfn-int8-manifest")==std::string::npos; }
+                    require(via_symlink_gate,(d.string()+": a dangling qfn-int8-manifest.json link did not reach the symlink gate").c_str());
+                };
+                dangling_manifest(temp.path/"manifest-link-int8",true);   // the width-error case of the bug
+                dangling_manifest(temp.path/"manifest-link-int4",false);  // the silently-scanning INT4 case
+                const auto absent=temp.path/"manifest-absent"; fs::create_directories(absent);
+                int4(absent/"model-00001-of-00001.safetensors");
+                { Checkpoint ck; ck.open(absent.string(),false,"");  // a true absence still scans, as today
+                  require(!ck.has_manifest && ck.format==WeightFormat::Int4,"a directory without a manifest stopped scanning"); }
+            }
             { // the manifest-less route keeps main's behavior for the MTP pair and for dangling links:
               // BOTH names (mtp.safetensors, mtp-int4.safetensors) are opened and cross-checked, a missing one
               // fails the start, a dangling *.safetensors link is an open failure and not a skip - except the
               // mtp-prefixed names, which main filters before it ever opens a name - and an explicit MTP
               // override replaces the pair. This is the layer the FLASH_MTP_K=0 fix lives on: qe_create asks
               // for the MTP block unconditionally (kmax only switches the draft off), pinned here as want_mtp=true.
-                const auto mtp_file=[&](const fs::path& p){
+                // mtp_file takes a payload fill byte: mtp.safetensors, mtp-int4.safetensors and the explicit
+                // override no longer share 32 zero bytes, so has("blk.weight") is not the only observable -
+                // payload_is tells WHICH file's bytes the loader actually mapped. The pair must stay
+                // byte-identical for the duplicate rule; the conflict case pins that a differing byte in
+                // one of the pair rejects the start, and that with the conflict in place the override opens
+                // its own bytes.
+                const auto mtp_file=[&](const fs::path& p,unsigned char fill){
                     std::string header="{\"blk.weight\":{\"dtype\":\"F16\",\"shape\":[4,4],\"data_offsets\":[0,32]}}";
                     while(header.size()%8) header+=' ';
                     std::ofstream out(p,std::ios::binary); const uint64_t len=header.size();
                     out.write(reinterpret_cast<const char*>(&len),8); out.write(header.data(),header.size());
-                    std::vector<char> payload(32,0); out.write(payload.data(),payload.size());
+                    std::vector<char> payload(32,(char)fill); out.write(payload.data(),payload.size());
+                };
+                const auto payload_is=[&](const Checkpoint& ck,unsigned char fill){
+                    const auto& t=ck.mtp.get("blk.weight");
+                    char expected[32]; memset(expected,(char)fill,sizeof expected);
+                    return t.nbytes==32 && memcmp(t.data,expected,sizeof expected)==0;
                 };
                 const auto mroot=temp.path/"mtp-route"; fs::create_directories(mroot);
                 int4(mroot/"model-00001-of-00001.safetensors");
-                mtp_file(mroot/"mtp.safetensors"); mtp_file(mroot/"mtp-int4.safetensors");
+                mtp_file(mroot/"mtp.safetensors",0xA1); mtp_file(mroot/"mtp-int4.safetensors",0xA1);
                 { Checkpoint ck; ck.open(mroot.string(),true,"");
-                  require(ck.mtp.has("blk.weight"),"manifest-less MTP pair did not open"); }
+                  require(ck.mtp.has("blk.weight"),"manifest-less MTP pair did not open");
+                  require(payload_is(ck,0xA1),"the opened MTP pair is not the fixture's own bytes"); }
                 { Checkpoint ck; ck.open(mroot.string(),false,"");   // want_mtp=false opens no MTP at all
                   require(!ck.mtp.has("blk.weight"),"MTP opened without want_mtp"); }
                 fs::remove(mroot/"mtp-int4.safetensors");
                 rejects([&]{ Checkpoint ck; ck.open(mroot.string(),true,""); });  // main needs both names
-                mtp_file(mroot/"mtp-int4.safetensors");
-                mtp_file(temp.path/"explicit-mtp2.safetensors");
+                mtp_file(mroot/"mtp-int4.safetensors",0xA1);  // identical pair restored: the route opens again
+                { Checkpoint ck; ck.open(mroot.string(),true,"");
+                  require(ck.mtp.has("blk.weight"),"restored MTP pair did not open");
+                  require(payload_is(ck,0xA1),"restored pair opened different bytes"); }
+                mtp_file(mroot/"mtp-int4.safetensors",0xB2);  // one of the pair carries different content
+                rejects([&]{ Checkpoint ck; ck.open(mroot.string(),true,""); });  // the cross-check is content, not names
+                mtp_file(temp.path/"explicit-mtp2.safetensors",0xC3);
                 { Checkpoint ck; ck.open(mroot.string(),true,(temp.path/"explicit-mtp2.safetensors").string());
-                  require(ck.mtp.has("blk.weight"),"MTP override did not open"); }
+                  require(ck.mtp.has("blk.weight"),"MTP override did not open");
+                  // with the pair conflict in place, only the override's own bytes can satisfy this:
+                  // neither the pair's 0xA1 nor the conflicting 0xB2 may appear
+                  require(payload_is(ck,0xC3),"the MTP override opened somebody else's bytes"); }
                 const auto dangle=temp.path/"dangling-dir"; fs::create_directories(dangle);
                 int4(dangle/"model-00001-of-00001.safetensors");
                 fs::create_symlink("no-such-target.safetensors",dangle/"link-00002-of-00009.safetensors");

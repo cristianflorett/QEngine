@@ -868,9 +868,9 @@ def cmd_make_qfn(a, cfg):
         "shard_limit_bytes": a.max_shard_bytes,
         "tensors": {"converted": converted, "preserved": preserved, "excluded": excluded},
         "ngram": ngram,
-        "runtime_supported": False,
-        "runtime_support_reason": ("no runtime in this repository executes INT8 W8 checkpoints yet; "
-                                   "the runtime is proposed separately")
+        "runtime_supported": True,
+        "runtime_support_reason": ("the flash INT8 W8 runtime executes this checkpoint "
+                                   "(loaded and served per qfn-int8-manifest.json)")
     }
     with open(os.path.join(a.out, "qfn-int8-manifest.json"), "w") as f:
         json.dump(manifest, f, indent=2)
@@ -1076,7 +1076,7 @@ def check_qfn(a, manifest_path, manifest):
     if int(recipe.get("search", -1)) != a.search or recipe.get("group_size") != 128:
         raise ValueError("--search/group_size does not match QFN manifest")
     if not isinstance(manifest.get("runtime_supported"), bool):
-        raise ValueError("QFN manifest must carry a boolean runtime_supported (review R2-8: presence and type are the contract; "
+        raise ValueError("QFN manifest must carry a boolean runtime_supported (presence and type are the contract; "
                          "true states the flash INT8 W8 runtime executes the checkpoint)")
     if not isinstance(manifest.get("source"), dict):
         raise ValueError("manifest is missing the source traceability record")
